@@ -1,3 +1,4 @@
 === 2026-06-22T04:10:42+00:00 — RapidOCR (rapidocr-onnxruntime) — 210/240 frames with boxes drawn ===
 === 2026-06-22T05:00:00+00:00 — Tesseract OCR (CLI, PSM 11) — 163/240 frames with boxes drawn ===
 === 2026-06-22T06:30:00+00:00 — Tesseract OCR (CLAHE+Otsu preprocessing, PSM 6) — 222/240 frames with boxes drawn ===
+=== 2026-06-22T07:00:00+00:00 — OCR.space Cloud API (Engine 2, frame-skip cache) — 149/240 frames with boxes drawn ===

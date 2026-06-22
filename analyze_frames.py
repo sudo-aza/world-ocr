@@ -21,37 +21,62 @@ LABEL_THICKNESS = 1
 
 
 def find_word(img, target):
-    """Find target word using Tesseract with CLAHE+Otsu preprocessing (PSM 6). Return list of (x1,y1,x2,y2,text,conf)."""
-    import tempfile
+    """Find target word using OCR.space cloud API (Engine 2). Return list of (x1,y1,x2,y2,text,conf)."""
+    import requests, base64, time, io, hashlib
     from PIL import Image
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    pil_img = Image.fromarray(binary)
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        tmp_path = tmp.name
-    pil_img.save(tmp_path)
+    if not hasattr(find_word, "_s"):
+        find_word._s = requests.Session()
+        find_word._s.headers["apikey"] = "helloworld"
+        find_word._t = 0
+        find_word._cache = {}
+        find_word._call_count = 0
+    # Frame skip cache: only call API every 5th unique frame
+    small = cv2.resize(img, (64, 36))
+    h = hashlib.md5(small.tobytes()).hexdigest()
+    if h in find_word._cache:
+        return find_word._cache[h]
+    find_word._call_count += 1
+    if find_word._call_count % 5 != 0 and find_word._cache:
+        # Reuse last result for skipped frames
+        find_word._cache[h] = list(find_word._cache.values())[-1] if find_word._cache else []
+        return find_word._cache[h]
+    elapsed = time.time() - find_word._t
+    if elapsed < 0.55:
+        time.sleep(0.55 - elapsed)
+    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=75)
+    b64 = base64.b64encode(buf.getvalue()).decode()
     try:
-        r = subprocess.run(
-            ["tesseract", tmp_path, "stdout", "-c", "tessedit_create_tsv=1", "--psm", "6"],
-            capture_output=True, text=True, timeout=15
-        )
-        lines = r.stdout.strip().split("\n")
-    finally:
-        os.unlink(tmp_path)
+        r = find_word._s.post(
+            "https://api.ocr.space/parse/image",
+            data={"base64Image": f"data:image/jpeg;base64,{b64}",
+                  "language": "eng", "isOverlayRequired": "true",
+                  "OCREngine": "2"},
+            timeout=10)
+        r.raise_for_status()
+    except Exception:
+        find_word._t = time.time()
+        find_word._cache[h] = []
+        return []
+    find_word._t = time.time()
+    data = r.json()
     matches = []
-    for line in lines[1:]:
-        parts = line.split("\t")
-        if len(parts) >= 12 and parts[0] == "5":
-            text = parts[11].strip()
-            if re.search(re.escape(target), text, re.IGNORECASE):
-                x1 = int(parts[6])
-                y1 = int(parts[7])
-                x2 = x1 + int(parts[8])
-                y2 = y1 + int(parts[9])
-                conf = float(parts[10]) / 100.0
-                matches.append((x1, y1, x2, y2, text, conf))
+    if data.get("IsErroredOnProcessing"):
+        find_word._cache[h] = []
+        return []
+    for res in data.get("ParsedResults", []):
+        for line in res.get("TextOverlay", {}).get("Lines", []):
+            for w in line.get("Words", []):
+                text = w.get("WordText", "")
+                if re.search(re.escape(target), text, re.IGNORECASE):
+                    x1 = int(w["Left"])
+                    y1 = int(w["Top"])
+                    x2 = x1 + int(w["Width"])
+                    y2 = y1 + int(w["Height"])
+                    conf = float(w.get("Confidence") or 0) / 100.0
+                    matches.append((x1, y1, x2, y2, text, conf))
+    find_word._cache[h] = matches
     return matches
 
 
