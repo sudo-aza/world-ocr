@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 analyze_frames.py — Dissect video, OCR each frame for "World", mark it, reassemble.
+The find_word() function is rewritten by the agent before each run.
 """
 
 import subprocess, os, re, shutil
@@ -21,22 +22,7 @@ LABEL_THICKNESS = 1
 
 def find_word(img, target):
     """Find target word in image. Return list of (x1,y1,x2,y2,text,conf)."""
-    import pytesseract
-    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT,
-                                      config="--psm 11 --oem 3")
-    matches = []
-    for i in range(len(data["text"])):
-        text = data["text"][i].strip()
-        if not text:
-            continue
-        if re.search(re.escape(target), text, re.IGNORECASE):
-            conf = int(data["conf"][i])
-            if conf < 10:
-                continue
-            x, y = data["left"][i], data["top"][i]
-            w, h = data["width"][i], data["height"][i]
-            matches.append((x, y, x + w, y + h, text, conf / 100.0))
-    return matches
+    raise NotImplementedError("find_word() must be implemented by the agent")
 
 
 def get_video_info(path):
