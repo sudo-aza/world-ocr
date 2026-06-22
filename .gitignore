@@ -1,0 +1,7 @@
+frames/
+marked/
+*.tmp.mp4
+cron.log
+__pycache__/
+*.pyc
+.venv/
