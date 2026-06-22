@@ -21,69 +21,22 @@ LABEL_THICKNESS = 1
 
 
 def find_word(img, target):
-    """Engine #8: PP-OCRv4 cv2.dnn DBNet + dilated score-mask box filtering.
-    Variant of engine #7: uses 3x3 dilation on probability map before thresholding,
-    DBBox-style mean-score filtering per contour (reject boxes below mean score 0.4),
-    and greedy horizontal NMS merge before recognition.
+    """Engine #10: cv2.dnn DBNet detection + Tesseract recognition.
+    Uses the proven PP-OCRv4 DBNet detector (cv2.dnn backend) for text
+    localization, then feeds detected crops to Tesseract PSM 7 (single
+    text line) for recognition. Tests detector quality vs. recognizer
+    quality by swapping the CRNN recognizer for Tesseract.
     Return list of (x1, y1, x2, y2, text, conf).
     """
-    import onnxruntime as ort
-    import math
-
     if not hasattr(find_word, "_det_net"):
         model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-        find_word._det_net = cv2.dnn.readNet(os.path.join(model_dir, "ch_PP-OCRv4_det_infer.onnx"))
-        opts = ort.SessionOptions()
-        opts.log_severity_level = 4
-        opts.enable_cpu_mem_arena = False
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        find_word._rec_sess = ort.InferenceSession(
-            os.path.join(model_dir, "ch_PP-OCRv4_rec_infer.onnx"),
-            sess_options=opts, providers=["CPUExecutionProvider"])
-        meta = find_word._rec_sess.get_modelmeta().custom_metadata_map
-        find_word._charset = ["blank"] + meta["character"].splitlines() + [" "]
+        find_word._det_net = cv2.dnn.readNet(
+            os.path.join(model_dir, "ch_PP-OCRv4_det_infer.onnx"))
 
     det_net = find_word._det_net
-    rec_sess = find_word._rec_sess
-    charset = find_word._charset
-
-    def _recognize(crop):
-        if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
-            return None, 0
-        crop_h, crop_w = crop.shape[:2]
-        wh_ratio = crop_w / float(crop_h)
-        img_width = max(int(48 * wh_ratio), 320)
-        resized_w = img_width if math.ceil(48 * wh_ratio) > img_width else int(math.ceil(48 * wh_ratio))
-        resized_crop = cv2.resize(crop, (resized_w, 48))
-        normed = (resized_crop.astype(np.float32) / 255.0 - 0.5) / 0.5
-        padded = np.zeros((3, 48, img_width), dtype=np.float32)
-        padded[:, :, :resized_w] = normed.transpose((2, 0, 1))
-        rec_out = rec_sess.run(None, {"x": padded[np.newaxis].astype(np.float32)})[0]
-        preds_idx = rec_out[0].argmax(axis=1)
-        preds_prob = rec_out[0].max(axis=1)
-        text_chars, conf_vals, prev_idx = [], [], -1
-        for t in range(len(preds_idx)):
-            idx = int(preds_idx[t])
-            if idx == 0 or idx == prev_idx:
-                continue
-            prev_idx = idx
-            if idx < len(charset):
-                text_chars.append(charset[idx])
-                conf_vals.append(float(preds_prob[t]))
-        text = "".join(text_chars).strip()
-        return (text, float(np.mean(conf_vals))) if text else (None, 0)
-
-    def _try_box(ox1, oy1, ox2, oy2):
-        ox1, oy1 = max(0, ox1), max(0, oy1)
-        ox2, oy2 = min(w, ox2), min(h, oy2)
-        if ox2 - ox1 < 5 or oy2 - oy1 < 3:
-            return None
-        text, conf = _recognize(img[oy1:oy2, ox1:ox2])
-        if text and re.search(re.escape(target), text, re.IGNORECASE):
-            return (ox1, oy1, ox2, oy2, text, conf)
-        return None
-
     h, w = img.shape[:2]
+
+    # DBNet detection (same as engines 7 & 8)
     max_side = 960
     ratio = min(max_side / max(h, w), 1.0)
     resize_h = int(round(h * ratio / 32) * 32)
@@ -97,10 +50,7 @@ def find_word(img, target):
     pred_h, pred_w = pred.shape
     sx, sy = w / pred_w, h / pred_h
 
-    # Post-processing: dilate probability map, then threshold with score filtering
-    kernel = np.ones((3, 3), dtype=np.float32)
-    dilated = cv2.dilate(pred, kernel, iterations=1)
-    bitmap = (dilated > 0.3).astype(np.uint8) * 255
+    bitmap = (pred > 0.3).astype(np.uint8) * 255
     if cv2.countNonZero(bitmap) == 0:
         return []
     outs = cv2.findContours(bitmap, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -110,12 +60,6 @@ def find_word(img, target):
     for c in contours:
         c = c.reshape(-1, 2).astype(np.float32)
         if len(c) < 4:
-            continue
-        # DBBox-style: compute mean score inside contour
-        mask = np.zeros((pred_h, pred_w), dtype=np.uint8)
-        cv2.fillPoly(mask, [c.astype(np.int32)], 1)
-        mean_score = pred[mask > 0].mean() if np.any(mask) else 0
-        if mean_score < 0.4:
             continue
         rect = cv2.minAreaRect(c)
         pts = cv2.boxPoints(rect)
@@ -130,24 +74,45 @@ def find_word(img, target):
     if not boxes:
         return []
 
-    # Greedy horizontal NMS merge
-    merged = [boxes[0]]
-    for b in boxes[1:]:
-        last = merged[-1]
-        if min(last[3], b[3]) - max(last[1], b[1]) > 0:
-            merged[-1] = (last[0], min(last[1], b[1]), b[2], max(last[3], b[3]))
-        else:
-            merged.append(b)
+    def _tesseract_recognize(crop):
+        """Recognize text in a crop using Tesseract PSM 7."""
+        if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
+            return None, 0
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+        _, buf = cv2.imencode(".png", gray)
+        result = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "7"],
+            input=buf.tobytes(), capture_output=True)
+        text = result.stdout.decode("utf-8", errors="replace").strip()
+        if not text:
+            return None, 0
+        text = " ".join(text.split())
+        # Estimate confidence from Tesseract stderr if available
+        conf = 0.7  # default since we don't parse TSV here
+        return (text, conf) if text else (None, 0)
 
-    # Try merged boxes, then individual, then global merge
-    for b in merged:
-        r = _try_box(*b)
-        if r:
-            return [r]
+    def _try_box(ox1, oy1, ox2, oy2):
+        ox1, oy1 = max(0, ox1), max(0, oy1)
+        ox2, oy2 = min(w, ox2), min(h, oy2)
+        if ox2 - ox1 < 5 or oy2 - oy1 < 3:
+            return None
+        text, conf = _tesseract_recognize(img[oy1:oy2, ox1:ox2])
+        if text and re.search(re.escape(target), text, re.IGNORECASE):
+            return (ox1, oy1, ox2, oy2, text, conf)
+        return None
+
+    # Try individual boxes, then merged pairs, then global merge
     for b in boxes:
         r = _try_box(*b)
         if r:
             return [r]
+    for i in range(len(boxes) - 1):
+        b1, b2 = boxes[i], boxes[i + 1]
+        if min(b1[3], b2[3]) - max(b1[1], b2[1]) > 0:
+            m = (b1[0], min(b1[1], b2[1]), b2[2], max(b1[3], b2[3]))
+            r = _try_box(*m)
+            if r:
+                return [r]
     m = (min(b[0] for b in boxes), min(b[1] for b in boxes),
          max(b[2] for b in boxes), max(b[3] for b in boxes))
     r = _try_box(*m)
