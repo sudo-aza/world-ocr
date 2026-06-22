@@ -20,124 +20,101 @@ LABEL_SCALE  = 0.55
 LABEL_THICKNESS = 1
 
 
+import warnings
+warnings.filterwarnings("ignore")
+
+# --- Engine #13: DBNet score-map row-scanning + EasyOCR attention-LSTM recognition ---
+# Novel two-stage approach:
+# Stage 1 (fast, ~30ms): DBNet produces a text probability heatmap via cv2.dnn.
+#   Row-wise score aggregation locates the dominant text line's Y-position.
+# Stage 2 (novel): Crop a wide strip from the original image at that Y-position
+#   and feed to EasyOCR's ResNet+BiLSTM+Attention decoder — a fundamentally
+#   different recognition architecture from the CRNN+CTC used in engines 7/8/11.
+import easyocr
+
+_det_net = None
+_recognizer = None
+
+def _init_models():
+    global _det_net, _recognizer
+    if _det_net is not None:
+        return
+    import time
+    t0 = time.time()
+    _det_net = cv2.dnn.readNetFromONNX("models/ch_PP-OCRv4_det_infer.onnx")
+    _det_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+    _recognizer = easyocr.Reader(['en'], gpu=False, verbose=False)
+    print(f"  Models loaded in {time.time()-t0:.1f}s (DBNet scorer + EasyOCR AttentionLSTM)")
+
+def _fuzzy_match(text, target, max_dist=2):
+    """Check if target appears in text with up to max_dist character edits."""
+    text_lower = text.lower()
+    target_lower = target.lower()
+    tlen = len(target_lower)
+    for i in range(len(text_lower) - tlen + 1):
+        window = text_lower[i:i + tlen]
+        diffs = sum(a != b for a, b in zip(window, target_lower))
+        if diffs <= max_dist:
+            return True
+    return False
+
+def _locate_text_strips(score_map, img_h, img_w, strip_half=35, top_n=3):
+    """Find top-N widest text regions from DBNet score map.
+    Returns list of (y1, y2, x1, x2) sorted by width descending.
+    """
+    binary = (score_map > 0.3).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+    binary = cv2.dilate(binary, kernel, iterations=1)
+    num_labels, labels = cv2.connectedComponents(binary)
+    components = []
+    for lid in range(1, num_labels):
+        py, px = np.where(labels == lid)
+        if len(px) < 10:
+            continue
+        x1, y1 = int(px.min()), int(py.min())
+        x2, y2 = int(px.max()), int(py.max())
+        components.append((x2 - x1, x1, y1, x2, y2))
+    components.sort(reverse=True)
+    strips = []
+    for (bw, x1, y1, x2, y2) in components[:top_n]:
+        strips.append((y1, y2, x1, x2))
+    return strips
+
 def find_word(img, target):
-    """Engine #11: cv2.dnn DBNet + CRNN at native 1280x720 resolution.
-    Same architecture as engine #7 but NO downscaling — runs DBNet at full
-    1280x720 (rounded to 1280x736 for 32-px alignment). Tests whether the
-    960px downscale in engines 7/8 sacrificed any detection quality.
+    """Engine #13: DBNet score-map + EasyOCR attention-LSTM.
     Return list of (x1, y1, x2, y2, text, conf).
     """
-    import onnxruntime as ort
-    import math
-
-    if not hasattr(find_word, "_init"):
-        model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-        find_word._det_net = cv2.dnn.readNet(os.path.join(model_dir, "ch_PP-OCRv4_det_infer.onnx"))
-        opts = ort.SessionOptions()
-        opts.log_severity_level = 4
-        opts.enable_cpu_mem_arena = False
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        find_word._rec_sess = ort.InferenceSession(
-            os.path.join(model_dir, "ch_PP-OCRv4_rec_infer.onnx"),
-            sess_options=opts, providers=["CPUExecutionProvider"])
-        meta = find_word._rec_sess.get_modelmeta().custom_metadata_map
-        find_word._charset = ["blank"] + meta["character"].splitlines() + [" "]
-        find_word._init = True
-
-    det_net = find_word._det_net
-    rec_sess = find_word._rec_sess
-    charset = find_word._charset
+    _init_models()
     h, w = img.shape[:2]
 
-    def _recognize(crop):
-        if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
-            return None, 0
-        crop_h, crop_w = crop.shape[:2]
-        wh_ratio = crop_w / float(crop_h)
-        img_width = max(int(48 * wh_ratio), 320)
-        resized_w = img_width if math.ceil(48 * wh_ratio) > img_width else int(math.ceil(48 * wh_ratio))
-        resized_crop = cv2.resize(crop, (resized_w, 48))
-        normed = (resized_crop.astype(np.float32) / 255.0 - 0.5) / 0.5
-        padded = np.zeros((3, 48, img_width), dtype=np.float32)
-        padded[:, :, :resized_w] = normed.transpose((2, 0, 1))
-        rec_out = rec_sess.run(None, {"x": padded[np.newaxis].astype(np.float32)})[0]
-        preds_idx = rec_out[0].argmax(axis=1)
-        preds_prob = rec_out[0].max(axis=1)
-        text_chars, conf_vals, prev_idx = [], [], -1
-        for t in range(len(preds_idx)):
-            idx = int(preds_idx[t])
-            if idx == 0 or idx == prev_idx:
-                continue
-            prev_idx = idx
-            if idx < len(charset):
-                text_chars.append(charset[idx])
-                conf_vals.append(float(preds_prob[t]))
-        text = "".join(text_chars).strip()
-        return (text, float(np.mean(conf_vals))) if text else (None, 0)
+    # Stage 1: DBNet score map
+    blob = cv2.dnn.blobFromImage(img, 1.0/255., (1280, 736),
+                                 (0.485, 0.456, 0.406), swapRB=True)
+    _det_net.setInput(blob)
+    score_map = _det_net.forward("sigmoid_0.tmp_0")[0, 0]
 
-    def _try_box(ox1, oy1, ox2, oy2):
-        ox1, oy1 = max(0, ox1), max(0, oy1)
-        ox2, oy2 = min(w, ox2), min(h, oy2)
-        if ox2 - ox1 < 5 or oy2 - oy1 < 3:
-            return None
-        text, conf = _recognize(img[oy1:oy2, ox1:ox2])
-        if text and re.search(re.escape(target), text, re.IGNORECASE):
-            return (ox1, oy1, ox2, oy2, text, conf)
-        return None
-
-    # NATIVE resolution — round to 32-px multiples, no downscale cap
-    resize_h = int(round(h / 32) * 32)
-    resize_w = int(round(w / 32) * 32)
-    resized = cv2.resize(img, (resize_w, resize_h))
-    det_input = (resized.astype(np.float32) / 255.0 - 0.5) / 0.5
-    det_input = det_input.transpose((2, 0, 1))[np.newaxis].astype(np.float32)
-    det_net.setInput(det_input)
-    pred = det_net.forward()[0, 0]
-
-    pred_h, pred_w = pred.shape
-    sx, sy = w / pred_w, h / pred_h
-
-    bitmap = (pred > 0.3).astype(np.uint8) * 255
-    if cv2.countNonZero(bitmap) == 0:
-        return []
-    outs = cv2.findContours(bitmap, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = outs[1] if len(outs) == 3 else outs[0]
-
-    boxes = []
-    for c in contours:
-        c = c.reshape(-1, 2).astype(np.float32)
-        if len(c) < 4:
-            continue
-        rect = cv2.minAreaRect(c)
-        pts = cv2.boxPoints(rect)
-        x1 = max(0, int(min(p[0] for p in pts) * sx))
-        y1 = max(0, int(min(p[1] for p in pts) * sy))
-        x2 = min(w, int(max(p[0] for p in pts) * sx))
-        y2 = min(h, int(max(p[1] for p in pts) * sy))
-        if x2 - x1 < 10 or y2 - y1 < 5:
-            continue
-        boxes.append((x1, y1, x2, y2))
-    boxes.sort(key=lambda b: b[0])
-    if not boxes:
+    # Locate text regions (widest first)
+    strips = _locate_text_strips(score_map, h, w, top_n=3)
+    if not strips:
         return []
 
-    for b in boxes:
-        r = _try_box(*b)
-        if r:
-            return [r]
-    for i in range(len(boxes) - 1):
-        b1, b2 = boxes[i], boxes[i + 1]
-        if min(b1[3], b2[3]) - max(b1[1], b2[1]) > 0:
-            m = (b1[0], min(b1[1], b2[1]), b2[2], max(b1[3], b2[3]))
-            r = _try_box(*m)
-            if r:
-                return [r]
-    m = (min(b[0] for b in boxes), min(b[1] for b in boxes),
-         max(b[2] for b in boxes), max(b[3] for b in boxes))
-    r = _try_box(*m)
-    if r:
-        return [r]
-    return []
+    # Stage 2: Try each region with EasyOCR
+    matches = []
+    for (y1, y2, x1, x2) in strips:
+        pad = 10
+        crop = img[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)]
+        rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        try:
+            results = _recognizer.recognize(rgb_crop)
+        except Exception:
+            continue
+        for (pts, text, conf) in results:
+            if _fuzzy_match(text, target, max_dist=2):
+                matches.append((x1, y1, x2, y2, text, float(conf)))
+                break
+        if matches:
+            break
+    return matches
 
 
 def get_video_info(path):

@@ -9,3 +9,5 @@
 === 2026-06-22T23:00:00+08:00 — cv2.dnn DBNet detection + Tesseract PSM 7 recognition (Engine 10) — 230/240 frames with boxes drawn ===
 === 2026-06-22T14:48:00+08:00 — Tesseract morphological top-hat + adaptive threshold (Engine 9) — 0/240 frames with boxes drawn ===
 === 2026-06-22T15:22:00+08:00 — PP-OCRv4 cv2.dnn DBNet + CRNN at native 1280x736 resolution (Engine 11) — 240/240 frames with boxes drawn ===
+=== 2026-06-22T15:30:00+08:00 — Tesseract bilateral filter preprocessing (Engine 12) — 0/240 frames with boxes drawn ===
+=== 2026-06-22T19:55:00+00:00 — DBNet score-map + EasyOCR attention-LSTM recognition (Engine 13) — 232/240 frames with boxes drawn ===
