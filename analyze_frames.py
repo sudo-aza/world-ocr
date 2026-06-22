@@ -21,63 +21,51 @@ LABEL_THICKNESS = 1
 
 
 def find_word(img, target):
-    """Find target word using OCR.space cloud API (Engine 2). Return list of (x1,y1,x2,y2,text,conf)."""
-    import requests, base64, time, io, hashlib
-    from PIL import Image
-    if not hasattr(find_word, "_s"):
-        find_word._s = requests.Session()
-        find_word._s.headers["apikey"] = "helloworld"
-        find_word._t = 0
-        find_word._cache = {}
-        find_word._call_count = 0
-    # Frame skip cache: only call API every 5th unique frame
-    small = cv2.resize(img, (64, 36))
-    h = hashlib.md5(small.tobytes()).hexdigest()
-    if h in find_word._cache:
-        return find_word._cache[h]
-    find_word._call_count += 1
-    if find_word._call_count % 5 != 0 and find_word._cache:
-        # Reuse last result for skipped frames
-        find_word._cache[h] = list(find_word._cache.values())[-1] if find_word._cache else []
-        return find_word._cache[h]
-    elapsed = time.time() - find_word._t
-    if elapsed < 0.55:
-        time.sleep(0.55 - elapsed)
-    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    buf = io.BytesIO()
-    pil_img.save(buf, format="JPEG", quality=75)
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    try:
-        r = find_word._s.post(
-            "https://api.ocr.space/parse/image",
-            data={"base64Image": f"data:image/jpeg;base64,{b64}",
-                  "language": "eng", "isOverlayRequired": "true",
-                  "OCREngine": "2"},
-            timeout=10)
-        r.raise_for_status()
-    except Exception:
-        find_word._t = time.time()
-        find_word._cache[h] = []
-        return []
-    find_word._t = time.time()
-    data = r.json()
-    matches = []
-    if data.get("IsErroredOnProcessing"):
-        find_word._cache[h] = []
-        return []
-    for res in data.get("ParsedResults", []):
-        for line in res.get("TextOverlay", {}).get("Lines", []):
-            for w in line.get("Words", []):
-                text = w.get("WordText", "")
-                if re.search(re.escape(target), text, re.IGNORECASE):
-                    x1 = int(w["Left"])
-                    y1 = int(w["Top"])
-                    x2 = x1 + int(w["Width"])
-                    y2 = y1 + int(w["Height"])
-                    conf = float(w.get("Confidence") or 0) / 100.0
-                    matches.append((x1, y1, x2, y2, text, conf))
-    find_word._cache[h] = matches
-    return matches
+    """Find target word using Tesseract OCR with word-level TSV bounding box output.
+    TSV mode gives pixel-precise per-word coordinates from tesseract's internal
+    layout analysis, with PSM 11 -> PSM 6 fallback for different page segmentation.
+    Return list of (x1, y1, x2, y2, text, conf).
+    """
+    h, w = img.shape[:2]
+
+    def _tesseract_tsv(psm_mode):
+        """Run tesseract with TSV file output, parse word-level bounding boxes."""
+        cv2.imwrite("/tmp/_tw_frame.png", img)
+        out_base = "/tmp/_tw_out"
+        # tesseract 5.x uses "--psm N" (space, not equals)
+        cmd = ["tesseract", "/tmp/_tw_frame.png", out_base,
+               "-l", "eng", "--psm", str(psm_mode), "tsv"]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        tsv_path = out_base + ".tsv"
+        if not os.path.isfile(tsv_path):
+            return []
+        results = []
+        with open(tsv_path, "r") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                # TSV: level page block para line word left top width height conf text
+                if len(parts) >= 12 and parts[11].strip():
+                    text = parts[11].strip()
+                    if re.search(re.escape(target), text, re.IGNORECASE):
+                        x1 = int(parts[6])
+                        y1 = int(parts[7])
+                        bw = int(parts[8])
+                        bh = int(parts[9])
+                        conf = float(parts[10])
+                        results.append((x1, y1, x1 + bw, y1 + bh, text, conf))
+        return results
+
+    # Strategy 1: PSM 11 (sparse text - good for video frames with overlaid text)
+    hits = _tesseract_tsv(11)
+    if hits:
+        return [hits[0]]
+
+    # Strategy 2: PSM 6 fallback (uniform block of text)
+    hits = _tesseract_tsv(6)
+    if hits:
+        return [hits[0]]
+
+    return []
 
 
 def get_video_info(path):
