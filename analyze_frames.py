@@ -21,23 +21,27 @@ LABEL_THICKNESS = 1
 
 
 def find_word(img, target):
-    """Find target word in image using Tesseract OCR (CLI). Return list of (x1,y1,x2,y2,text,conf)."""
-    from PIL import Image
+    """Find target word using Tesseract with CLAHE+Otsu preprocessing (PSM 6). Return list of (x1,y1,x2,y2,text,conf)."""
     import tempfile
-    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    from PIL import Image
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    pil_img = Image.fromarray(binary)
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         tmp_path = tmp.name
     pil_img.save(tmp_path)
     try:
         r = subprocess.run(
-            ["tesseract", tmp_path, "stdout", "-c", "tessedit_create_tsv=1", "--psm", "11"],
+            ["tesseract", tmp_path, "stdout", "-c", "tessedit_create_tsv=1", "--psm", "6"],
             capture_output=True, text=True, timeout=15
         )
         lines = r.stdout.strip().split("\n")
     finally:
         os.unlink(tmp_path)
     matches = []
-    for line in lines[1:]:  # skip header
+    for line in lines[1:]:
         parts = line.split("\t")
         if len(parts) >= 12 and parts[0] == "5":
             text = parts[11].strip()
