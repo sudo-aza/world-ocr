@@ -1,6 +1,7 @@
 frames/
 marked/
 cron.log
+output.mp4
 __pycache__/
 *.pyc
 .venv/
