@@ -21,50 +21,124 @@ LABEL_THICKNESS = 1
 
 
 def find_word(img, target):
-    """Find target word using Tesseract OCR with word-level TSV bounding box output.
-    TSV mode gives pixel-precise per-word coordinates from tesseract's internal
-    layout analysis, with PSM 11 -> PSM 6 fallback for different page segmentation.
+    """Find target word using PP-OCRv4 via OpenCV DNN backend.
+    cv2.dnn inference produces dramatically sharper DBNet probability maps than
+    onnxruntime (max 1.0 vs 0.6). Detection uses minAreaRect contour post-processing,
+    recognition uses onnxruntime CRNN + CTC decoding.
     Return list of (x1, y1, x2, y2, text, conf).
     """
+    import onnxruntime as ort
+    import math
+
+    if not hasattr(find_word, "_det_net"):
+        model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        find_word._det_net = cv2.dnn.readNet(os.path.join(model_dir, "ch_PP-OCRv4_det_infer.onnx"))
+        opts = ort.SessionOptions()
+        opts.log_severity_level = 4
+        opts.enable_cpu_mem_arena = False
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        find_word._rec_sess = ort.InferenceSession(
+            os.path.join(model_dir, "ch_PP-OCRv4_rec_infer.onnx"),
+            sess_options=opts, providers=["CPUExecutionProvider"])
+        meta = find_word._rec_sess.get_modelmeta().custom_metadata_map
+        find_word._charset = ["blank"] + meta["character"].splitlines() + [" "]
+
+    det_net = find_word._det_net
+    rec_sess = find_word._rec_sess
+    charset = find_word._charset
+
+    def _recognize(crop):
+        if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
+            return None, 0
+        crop_h, crop_w = crop.shape[:2]
+        wh_ratio = crop_w / float(crop_h)
+        img_width = max(int(48 * wh_ratio), 320)
+        resized_w = img_width if math.ceil(48 * wh_ratio) > img_width else int(math.ceil(48 * wh_ratio))
+        resized_crop = cv2.resize(crop, (resized_w, 48))
+        normed = (resized_crop.astype(np.float32) / 255.0 - 0.5) / 0.5
+        padded = np.zeros((3, 48, img_width), dtype=np.float32)
+        padded[:, :, :resized_w] = normed.transpose((2, 0, 1))
+        rec_out = rec_sess.run(None, {"x": padded[np.newaxis].astype(np.float32)})[0]
+        preds_idx = rec_out[0].argmax(axis=1)
+        preds_prob = rec_out[0].max(axis=1)
+        text_chars, conf_vals, prev_idx = [], [], -1
+        for t in range(len(preds_idx)):
+            idx = int(preds_idx[t])
+            if idx == 0 or idx == prev_idx:
+                continue
+            prev_idx = idx
+            if idx < len(charset):
+                text_chars.append(charset[idx])
+                conf_vals.append(float(preds_prob[t]))
+        text = "".join(text_chars).strip()
+        return (text, float(np.mean(conf_vals))) if text else (None, 0)
+
+    def _try_box(ox1, oy1, ox2, oy2):
+        ox1, oy1 = max(0, ox1), max(0, oy1)
+        ox2, oy2 = min(w, ox2), min(h, oy2)
+        if ox2 - ox1 < 5 or oy2 - oy1 < 3:
+            return None
+        text, conf = _recognize(img[oy1:oy2, ox1:ox2])
+        if text and re.search(re.escape(target), text, re.IGNORECASE):
+            return (ox1, oy1, ox2, oy2, text, conf)
+        return None
+
     h, w = img.shape[:2]
+    max_side = 960
+    ratio = min(max_side / max(h, w), 1.0)
+    resize_h = int(round(h * ratio / 32) * 32)
+    resize_w = int(round(w * ratio / 32) * 32)
+    resized = cv2.resize(img, (resize_w, resize_h))
+    det_input = (resized.astype(np.float32) / 255.0 - 0.5) / 0.5
+    det_input = det_input.transpose((2, 0, 1))[np.newaxis].astype(np.float32)
+    det_net.setInput(det_input)
+    pred = det_net.forward()[0, 0]
 
-    def _tesseract_tsv(psm_mode):
-        """Run tesseract with TSV file output, parse word-level bounding boxes."""
-        cv2.imwrite("/tmp/_tw_frame.png", img)
-        out_base = "/tmp/_tw_out"
-        # tesseract 5.x uses "--psm N" (space, not equals)
-        cmd = ["tesseract", "/tmp/_tw_frame.png", out_base,
-               "-l", "eng", "--psm", str(psm_mode), "tsv"]
-        subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        tsv_path = out_base + ".tsv"
-        if not os.path.isfile(tsv_path):
-            return []
-        results = []
-        with open(tsv_path, "r") as f:
-            for line in f:
-                parts = line.strip().split("\t")
-                # TSV: level page block para line word left top width height conf text
-                if len(parts) >= 12 and parts[11].strip():
-                    text = parts[11].strip()
-                    if re.search(re.escape(target), text, re.IGNORECASE):
-                        x1 = int(parts[6])
-                        y1 = int(parts[7])
-                        bw = int(parts[8])
-                        bh = int(parts[9])
-                        conf = float(parts[10])
-                        results.append((x1, y1, x1 + bw, y1 + bh, text, conf))
-        return results
+    pred_h, pred_w = pred.shape
+    sx, sy = w / pred_w, h / pred_h
 
-    # Strategy 1: PSM 11 (sparse text - good for video frames with overlaid text)
-    hits = _tesseract_tsv(11)
-    if hits:
-        return [hits[0]]
+    # Post-processing: threshold -> contours -> minAreaRect boxes
+    bitmap = (pred > 0.3).astype(np.uint8) * 255
+    if cv2.countNonZero(bitmap) == 0:
+        return []
+    outs = cv2.findContours(bitmap, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = outs[1] if len(outs) == 3 else outs[0]
 
-    # Strategy 2: PSM 6 fallback (uniform block of text)
-    hits = _tesseract_tsv(6)
-    if hits:
-        return [hits[0]]
+    boxes = []
+    for c in contours:
+        c = c.reshape(-1, 2).astype(np.float32)
+        if len(c) < 4:
+            continue
+        rect = cv2.minAreaRect(c)
+        pts = cv2.boxPoints(rect)
+        x1 = max(0, int(min(p[0] for p in pts) * sx))
+        y1 = max(0, int(min(p[1] for p in pts) * sy))
+        x2 = min(w, int(max(p[0] for p in pts) * sx))
+        y2 = min(h, int(max(p[1] for p in pts) * sy))
+        if x2 - x1 < 10 or y2 - y1 < 5:
+            continue
+        boxes.append((x1, y1, x2, y2))
+    boxes.sort(key=lambda b: b[0])
+    if not boxes:
+        return []
 
+    # Try individual boxes, then merged pairs, then merge all
+    for b in boxes:
+        r = _try_box(*b)
+        if r:
+            return [r]
+    for i in range(len(boxes) - 1):
+        b1, b2 = boxes[i], boxes[i + 1]
+        if min(b1[3], b2[3]) - max(b1[1], b2[1]) > 0:
+            m = (b1[0], min(b1[1], b2[1]), b2[2], max(b1[3], b2[3]))
+            r = _try_box(*m)
+            if r:
+                return [r]
+    m = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+         max(b[2] for b in boxes), max(b[3] for b in boxes))
+    r = _try_box(*m)
+    if r:
+        return [r]
     return []
 
 

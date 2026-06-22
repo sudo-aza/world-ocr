@@ -2,3 +2,6 @@
 === 2026-06-22T05:00:00+00:00 — Tesseract OCR (CLI, PSM 11) — 163/240 frames with boxes drawn ===
 === 2026-06-22T06:30:00+00:00 — Tesseract OCR (CLAHE+Otsu preprocessing, PSM 6) — 222/240 frames with boxes drawn ===
 === 2026-06-22T07:00:00+00:00 — OCR.space Cloud API (Engine 2, frame-skip cache) — 149/240 frames with boxes drawn ===
+=== 2026-06-22T11:30:00+08:00 — PP-OCRv4 via raw onnxruntime (DBNet+CRNN, hierarchical merging) — 105/240 frames with boxes drawn ===
+=== 2026-06-22T06:07:38+00:00 — Tesseract OCR (word-level TSV bounding box output, PSM 11+6 fallback) — 238/240 frames with boxes drawn ===
+=== 2026-06-22T06:21:08+00:00 — PP-OCRv4 via OpenCV DNN (cv2.dnn DBNet detection + onnxruntime CRNN, minAreaRect post-proc) — 240/240 frames with boxes drawn ===
