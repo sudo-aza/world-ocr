@@ -5,3 +5,4 @@
 === 2026-06-22T11:30:00+08:00 — PP-OCRv4 via raw onnxruntime (DBNet+CRNN, hierarchical merging) — 105/240 frames with boxes drawn ===
 === 2026-06-22T06:07:38+00:00 — Tesseract OCR (word-level TSV bounding box output, PSM 11+6 fallback) — 238/240 frames with boxes drawn ===
 === 2026-06-22T06:21:08+00:00 — PP-OCRv4 via OpenCV DNN (cv2.dnn DBNet detection + onnxruntime CRNN, minAreaRect post-proc) — 240/240 frames with boxes drawn ===
+=== 2026-06-22T14:31:00+08:00 — PP-OCRv4 cv2.dnn DBNet + dilated score-mask filtering (Engine 8) — 240/240 frames with boxes drawn ===

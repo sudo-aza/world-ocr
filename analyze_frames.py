@@ -21,10 +21,10 @@ LABEL_THICKNESS = 1
 
 
 def find_word(img, target):
-    """Find target word using PP-OCRv4 via OpenCV DNN backend.
-    cv2.dnn inference produces dramatically sharper DBNet probability maps than
-    onnxruntime (max 1.0 vs 0.6). Detection uses minAreaRect contour post-processing,
-    recognition uses onnxruntime CRNN + CTC decoding.
+    """Engine #8: PP-OCRv4 cv2.dnn DBNet + dilated score-mask box filtering.
+    Variant of engine #7: uses 3x3 dilation on probability map before thresholding,
+    DBBox-style mean-score filtering per contour (reject boxes below mean score 0.4),
+    and greedy horizontal NMS merge before recognition.
     Return list of (x1, y1, x2, y2, text, conf).
     """
     import onnxruntime as ort
@@ -97,8 +97,10 @@ def find_word(img, target):
     pred_h, pred_w = pred.shape
     sx, sy = w / pred_w, h / pred_h
 
-    # Post-processing: threshold -> contours -> minAreaRect boxes
-    bitmap = (pred > 0.3).astype(np.uint8) * 255
+    # Post-processing: dilate probability map, then threshold with score filtering
+    kernel = np.ones((3, 3), dtype=np.float32)
+    dilated = cv2.dilate(pred, kernel, iterations=1)
+    bitmap = (dilated > 0.3).astype(np.uint8) * 255
     if cv2.countNonZero(bitmap) == 0:
         return []
     outs = cv2.findContours(bitmap, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -108,6 +110,12 @@ def find_word(img, target):
     for c in contours:
         c = c.reshape(-1, 2).astype(np.float32)
         if len(c) < 4:
+            continue
+        # DBBox-style: compute mean score inside contour
+        mask = np.zeros((pred_h, pred_w), dtype=np.uint8)
+        cv2.fillPoly(mask, [c.astype(np.int32)], 1)
+        mean_score = pred[mask > 0].mean() if np.any(mask) else 0
+        if mean_score < 0.4:
             continue
         rect = cv2.minAreaRect(c)
         pts = cv2.boxPoints(rect)
@@ -122,18 +130,24 @@ def find_word(img, target):
     if not boxes:
         return []
 
-    # Try individual boxes, then merged pairs, then merge all
+    # Greedy horizontal NMS merge
+    merged = [boxes[0]]
+    for b in boxes[1:]:
+        last = merged[-1]
+        if min(last[3], b[3]) - max(last[1], b[1]) > 0:
+            merged[-1] = (last[0], min(last[1], b[1]), b[2], max(last[3], b[3]))
+        else:
+            merged.append(b)
+
+    # Try merged boxes, then individual, then global merge
+    for b in merged:
+        r = _try_box(*b)
+        if r:
+            return [r]
     for b in boxes:
         r = _try_box(*b)
         if r:
             return [r]
-    for i in range(len(boxes) - 1):
-        b1, b2 = boxes[i], boxes[i + 1]
-        if min(b1[3], b2[3]) - max(b1[1], b2[1]) > 0:
-            m = (b1[0], min(b1[1], b2[1]), b2[2], max(b1[3], b2[3]))
-            r = _try_box(*m)
-            if r:
-                return [r]
     m = (min(b[0] for b in boxes), min(b[1] for b in boxes),
          max(b[2] for b in boxes), max(b[3] for b in boxes))
     r = _try_box(*m)
