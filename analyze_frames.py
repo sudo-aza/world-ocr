@@ -21,21 +21,33 @@ LABEL_THICKNESS = 1
 
 
 def find_word(img, target):
-    """Find target word in image using RapidOCR. Return list of (x1,y1,x2,y2,text,conf)."""
-    from rapidocr_onnxruntime import RapidOCR
-    if not hasattr(find_word, "_engine"):
-        find_word._engine = RapidOCR()
-    result, _ = find_word._engine(img)
-    if not result:
-        return []
+    """Find target word in image using Tesseract OCR (CLI). Return list of (x1,y1,x2,y2,text,conf)."""
+    from PIL import Image
+    import tempfile
+    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    pil_img.save(tmp_path)
+    try:
+        r = subprocess.run(
+            ["tesseract", tmp_path, "stdout", "-c", "tessedit_create_tsv=1", "--psm", "11"],
+            capture_output=True, text=True, timeout=15
+        )
+        lines = r.stdout.strip().split("\n")
+    finally:
+        os.unlink(tmp_path)
     matches = []
-    for item in result:
-        bbox_pts, text, conf = item[0], item[1], item[2]
-        if re.search(re.escape(target), text, re.IGNORECASE):
-            pts = np.array(bbox_pts).astype(int)
-            x1, y1 = pts.min(axis=0)
-            x2, y2 = pts.max(axis=0)
-            matches.append((int(x1), int(y1), int(x2), int(y2), text, float(conf)))
+    for line in lines[1:]:  # skip header
+        parts = line.split("\t")
+        if len(parts) >= 12 and parts[0] == "5":
+            text = parts[11].strip()
+            if re.search(re.escape(target), text, re.IGNORECASE):
+                x1 = int(parts[6])
+                y1 = int(parts[7])
+                x2 = x1 + int(parts[8])
+                y2 = y1 + int(parts[9])
+                conf = float(parts[10]) / 100.0
+                matches.append((x1, y1, x2, y2, text, conf))
     return matches
 
 
