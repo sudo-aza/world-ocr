@@ -1,10 +1,6 @@
 frames/
 marked/
-*.tmp.mp4
 cron.log
 __pycache__/
 *.pyc
 .venv/
-engines_done.json
-results_*.json
-output_*.mp4
