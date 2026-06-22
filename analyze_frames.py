@@ -21,8 +21,22 @@ LABEL_THICKNESS = 1
 
 
 def find_word(img, target):
-    """Find target word in image. Return list of (x1,y1,x2,y2,text,conf)."""
-    raise NotImplementedError("find_word() must be implemented by the agent")
+    """Find target word in image using RapidOCR. Return list of (x1,y1,x2,y2,text,conf)."""
+    from rapidocr_onnxruntime import RapidOCR
+    if not hasattr(find_word, "_engine"):
+        find_word._engine = RapidOCR()
+    result, _ = find_word._engine(img)
+    if not result:
+        return []
+    matches = []
+    for item in result:
+        bbox_pts, text, conf = item[0], item[1], item[2]
+        if re.search(re.escape(target), text, re.IGNORECASE):
+            pts = np.array(bbox_pts).astype(int)
+            x1, y1 = pts.min(axis=0)
+            x2, y2 = pts.max(axis=0)
+            matches.append((int(x1), int(y1), int(x2), int(y2), text, float(conf)))
+    return matches
 
 
 def get_video_info(path):
