@@ -4,7 +4,7 @@ analyze_frames.py — Dissect video, OCR each frame for "World", mark it, reasse
 The find_word() function is rewritten by the agent before each run.
 """
 
-import subprocess, os, re, shutil, tempfile
+import subprocess, os, re, shutil
 from pathlib import Path
 import cv2, numpy as np
 
@@ -23,87 +23,24 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #14: DBNet score-map template tracking ---
-# Two-phase approach:
-# Phase 1 (frame 1): DBNet score map → Tesseract finds "World" position →
-#   extract score-map template around "World".
-# Phase 2 (frames 2+): DBNet score map → cv2.matchTemplate to track "World"
-#   position in the score map. No Tesseract needed after initialization.
-# This is ~35ms/frame (DBNet + template match) vs ~500ms/frame with Tesseract.
-# Novel: score-map based template tracking for OCR word localization.
-import onnxruntime as ort
+# --- Engine #15: tesserocr (Tesseract C API binding) full-frame OCR ---
+# Novel: uses tesserocr's PyTessBaseAPI direct C library binding instead of
+# subprocess-based Tesseract CLI or pytesseract wrapper. Eliminates process
+# spawn overhead (~0.18s/frame vs ~0.5s/frame with subprocess).
+# PSM SINGLE_BLOCK for robust text line detection on each frame.
+# Distinct from all prior Tesseract engines (2,3,6,9,10,12) which used CLI subprocess.
+import tesserocr
+from PIL import Image as PILImage
 
-_det_session = None
-_template = None       # Score-map crop (numpy float32)
-_tmpl_box_det = None   # (sx1, sy1, sx2, sy2) in score map coords
-_tmpl_box_img = None   # (x1, y1, x2, y2) in original image coords
-_tmpl_text = ""
-_tmpl_conf = 0.0
-_tmpl_center_det = None  # (cx, cy) in score map coords for search window
-
-def _init_detector():
-    global _det_session
-    if _det_session is not None:
-        return
-    import time
-    t0 = time.time()
-    so = ort.SessionOptions()
-    so.inter_op_num_threads = 1
-    so.intra_op_num_threads = 4
-    _det_session = ort.InferenceSession(
-        "models/ch_PP-OCRv4_det_infer.onnx", so,
-        providers=['CPUExecutionProvider'])
-    print(f"  DBNet (onnxruntime) loaded in {time.time()-t0:.1f}s")
-
-
-def _run_dbnet(img_bgr):
-    """Run DBNet and return score map (det_h, det_w)."""
-    det_h, det_w = 736, 1280
-    img_resized = cv2.resize(img_bgr, (det_w, det_h))
-    blob = (img_resized.astype(np.float32) / 255.0
-            - np.array([0.485, 0.456, 0.406], dtype=np.float32)) \
-           / np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    blob = blob.transpose(2, 0, 1)[np.newaxis]
-    inputs = {_det_session.get_inputs()[0].name: blob}
-    score_map = _det_session.run(None, inputs)[0][0, 0]
-    return score_map, det_h, det_w
-
-
-def _tesseract_tsv(img_crop):
-    """Run Tesseract PSM 7 TSV. Return list of (left,top,w,h,conf,text)."""
-    tmp_path = None
-    try:
-        fd, tmp_path = tempfile.mkstemp(suffix='.png')
-        os.close(fd)
-        cv2.imwrite(tmp_path, img_crop, [cv2.IMWRITE_PNG_COMPRESSION, 3])
-        result = subprocess.run(
-            ['tesseract', tmp_path, '-', 'tsv',
-             '--psm', '7', '-l', 'eng', '--oem', '3'],
-            capture_output=True, text=True, timeout=10)
-        words = []
-        for line in result.stdout.strip().split('\n'):
-            parts = line.split('\t')
-            if len(parts) < 12 or parts[0] != '5':
-                continue
-            try:
-                words.append((int(parts[6]), int(parts[7]),
-                              int(parts[8]), int(parts[9]),
-                              float(parts[10]) / 100.0,
-                              parts[11]))
-            except (ValueError, IndexError):
-                continue
-        return words
-    except Exception:
-        return []
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+_tess_path = '/usr/share/tesseract-ocr/5/tessdata'
 
 
 def _fuzzy_match(text, target, max_dist=2):
     text_lower = text.lower().strip()
     target_lower = target.lower()
     tlen = len(target_lower)
+    if len(text_lower) < tlen:
+        return False
     for i in range(len(text_lower) - tlen + 1):
         window = text_lower[i:i + tlen]
         diffs = sum(a != b for a, b in zip(window, target_lower))
@@ -113,91 +50,31 @@ def _fuzzy_match(text, target, max_dist=2):
 
 
 def find_word(img_bgr, target):
-    """Engine #14: DBNet score-map template tracking.
+    """Engine #15: tesserocr C API binding, full-frame PSM 6.
     Return list of (x1, y1, x2, y2, text, conf).
     """
-    global _template, _tmpl_box_det, _tmpl_box_img, _tmpl_text, _tmpl_conf
-    global _tmpl_center_det
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = PILImage.fromarray(rgb)
 
-    _init_detector()
-    h, w = img_bgr.shape[:2]
-    score_map, det_h, det_w = _run_dbnet(img_bgr)
-    scale_x = w / det_w
-    scale_y = h / det_h
+    api = tesserocr.PyTessBaseAPI(path=_tess_path, lang='eng')
+    api.SetImage(pil_img)
+    api.SetPageSegMode(tesserocr.PSM.SINGLE_BLOCK)
+    api.Recognize()
 
-    # Phase 1: Initialize template from first detection
-    if _template is None:
-        # Row projection to find text line
-        row_scores = score_map.sum(axis=1)
-        if row_scores.max() == 0:
-            return []
-        text_y_det = int(np.argmax(row_scores))
+    matches = []
+    level = tesserocr.RIL.WORD
+    for ri in tesserocr.iterate_level(api.GetIterator(), level):
+        text = ri.GetUTF8Text(level)
+        conf = ri.Confidence(level) / 100.0
+        if conf < 0.3 or not text:
+            continue
+        if _fuzzy_match(text, target, max_dist=2):
+            bbox = ri.BoundingBox(level)  # (x1, y1, x2, y2)
+            matches.append((bbox[0], bbox[1], bbox[2], bbox[3], text, conf))
+            break  # First match is enough
 
-        # Extract full-width strip from original image
-        strip_half = 35
-        y1_img = max(0, int(text_y_det * scale_y) - strip_half)
-        y2_img = min(h, int(text_y_det * scale_y) + strip_half)
-        strip = img_bgr[y1_img:y2_img, :]
-
-        words = _tesseract_tsv(strip)
-        for (left, top, bw, bh, conf, text) in words:
-            if _fuzzy_match(text, target, max_dist=2):
-                # Convert strip coordinates to score map coordinates
-                sx1 = int(left / scale_x)
-                sy1 = int((y1_img + top) / scale_y)
-                sx2 = int((left + bw) / scale_x)
-                sy2 = int((y1_img + top + bh) / scale_y)
-
-                # Clamp to score map bounds
-                sx1 = max(0, min(sx1, det_w - 1))
-                sy1 = max(0, min(sy1, det_h - 1))
-                sx2 = max(sx1 + 1, min(sx2, det_w))
-                sy2 = max(sy1 + 1, min(sy2, det_h))
-
-                _template = score_map[sy1:sy2, sx1:sx2].astype(np.float32).copy()
-                _tmpl_box_det = (sx1, sy1, sx2, sy2)
-                _tmpl_box_img = (left, y1_img + top, left + bw, y1_img + top + bh)
-                _tmpl_text = text
-                _tmpl_conf = conf
-                _tmpl_center_det = ((sx1 + sx2) / 2, (sy1 + sy2) / 2)
-
-                return [(left, y1_img + top, left + bw, y1_img + top + bh,
-                          text, conf)]
-        return []
-
-    # Phase 2: Template match in score map
-    th, tw = _template.shape
-    tcx, tcy = _tmpl_center_det
-
-    # Search window: template size + 100px margin in each direction
-    margin = 100
-    sw_x1 = max(0, int(tcx - tw / 2 - margin))
-    sw_y1 = max(0, int(tcy - th / 2 - margin))
-    sw_x2 = min(det_w, int(tcx + tw / 2 + margin))
-    sw_y2 = min(det_h, int(tcy + th / 2 + margin))
-
-    search_region = score_map[sw_y1:sw_y2, sw_x1:sw_x2].astype(np.float32)
-    result = cv2.matchTemplate(search_region, _template, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-    if max_val < 0.3:
-        return []
-
-    # Map back to score map then to original image coordinates
-    match_sx1 = sw_x1 + max_loc[0]
-    match_sy1 = sw_y1 + max_loc[1]
-    match_sx2 = match_sx1 + tw
-    match_sy2 = match_sy1 + th
-
-    ox1 = int(match_sx1 * scale_x)
-    oy1 = int(match_sy1 * scale_y)
-    ox2 = int(match_sx2 * scale_x)
-    oy2 = int(match_sy2 * scale_y)
-
-    # Update template center for next frame
-    _tmpl_center_det = ((match_sx1 + match_sx2) / 2, (match_sy1 + match_sy2) / 2)
-
-    return [(ox1, oy1, ox2, oy2, _tmpl_text, float(max_val))]
+    api.End()
+    return matches
 
 
 def get_video_info(path):
