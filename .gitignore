@@ -5,3 +5,6 @@ cron.log
 __pycache__/
 *.pyc
 .venv/
+.engine_index
+results_*.json
+output_*.mp4

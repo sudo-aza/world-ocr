@@ -2,8 +2,14 @@
 """
 analyze_frames.py — Dissect video, OCR each frame for "World", mark it, reassemble.
 
-Default engine: Tesseract 5 (fast, hourly-cron friendly).
-Set OCR_ENGINE=paddle to use PaddleOCR (slower, higher accuracy on complex scenes).
+Supported engines (via OCR_ENGINE env var):
+  tesseract  — Tesseract 5 (fast, decent accuracy)
+  paddle    — PaddleOCR PP-OCRv4 (slower, good on complex scenes)
+  easyocr   — EasyOCR (PyTorch-based, strong multilingual)
+
+Outputs:
+  output.mp4          — reassembled video with boxes drawn
+  results_<engine>.json — per-frame detection summary for this engine run
 """
 
 import subprocess
@@ -11,6 +17,8 @@ import sys
 import os
 import re
 import shutil
+import json
+import time
 from pathlib import Path
 
 import cv2
@@ -87,13 +95,31 @@ def find_word_paddle(image_bgr, target):
             det_db_thresh=0.3, det_db_box_thresh=0.5
         )
     ocr = find_word_paddle._ocr
-    # PaddleOCR expects BGR
     result = ocr.ocr(image_bgr, cls=False, det_db_thresh=0.3, det_db_box_thresh=0.5)
     if not result or not result[0]:
         return []
     matches = []
     for line in result[0]:
         bbox_pts, (text, conf) = line[0], line[1]
+        if re.search(re.escape(target), text, re.IGNORECASE):
+            pts = np.array(bbox_pts).astype(int)
+            x1, y1 = pts.min(axis=0)
+            x2, y2 = pts.max(axis=0)
+            matches.append((int(x1), int(y1), int(x2), int(y2), text, conf))
+    return matches
+
+
+def find_word_easyocr(image_bgr, target):
+    """Use EasyOCR to find word bounding boxes. Returns list of (x1,y1,x2,y2,text,conf)."""
+    import easyocr
+    if not hasattr(find_word_easyocr, "_reader"):
+        find_word_easyocr._reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+    reader = find_word_easyocr._reader
+    # EasyOCR expects RGB
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    results = reader.readtext(image_rgb)
+    matches = []
+    for (bbox_pts, text, conf) in results:
         if re.search(re.escape(target), text, re.IGNORECASE):
             pts = np.array(bbox_pts).astype(int)
             x1, y1 = pts.min(axis=0)
@@ -136,7 +162,15 @@ def main():
     os.chdir(script_dir)
 
     engine = os.environ.get("OCR_ENGINE", "tesseract")
-    find_fn = find_word_paddle if engine == "paddle" else find_word_tesseract
+    engine_map = {
+        "tesseract": find_word_tesseract,
+        "paddle": find_word_paddle,
+        "easyocr": find_word_easyocr,
+    }
+    if engine not in engine_map:
+        print(f"  ERROR: unknown engine '{engine}'. Choose from: {', '.join(engine_map)}")
+        sys.exit(1)
+    find_fn = engine_map[engine]
     print(f"  OCR engine: {engine}")
 
     print(f"[1/4] Reading {INPUT_VIDEO}")
@@ -150,26 +184,59 @@ def main():
     os.makedirs(MARKED_DIR, exist_ok=True)
 
     found = 0
+    per_frame = []
+    total_conf = 0.0
+    conf_count = 0
+
     for idx, fp in enumerate(frames):
         img = cv2.imread(str(fp))
         if img is None:
             continue
 
+        t0 = time.time()
         matches = find_fn(img, TARGET_WORD)
+        elapsed = time.time() - t0
+
+        frame_matches = []
         if matches:
             found += 1
             for x1, y1, x2, y2, text, conf in matches:
                 img = draw_box(img, x1, y1, x2, y2, text, conf)
+                total_conf += conf
+                conf_count += 1
+                frame_matches.append({
+                    "text": text, "conf": round(conf, 4),
+                    "box": [x1, y1, x2, y2]
+                })
 
         cv2.imwrite(str(Path(MARKED_DIR) / fp.name), img)
+        per_frame.append({
+            "frame": fp.name, "found": len(matches) > 0,
+            "matches": frame_matches, "time_s": round(elapsed, 3)
+        })
 
         if (idx + 1) % 30 == 0 or idx == len(frames) - 1:
             print(f"  ... {idx + 1}/{len(frames)} frames processed, {found} with \"{TARGET_WORD}\"")
 
+    avg_conf = (total_conf / conf_count) if conf_count else 0.0
     print(f"  Found \"{TARGET_WORD}\" in {found}/{len(frames)} frames")
+    print(f"  Avg confidence: {avg_conf:.1%}")
 
     print(f"[4/4] Reassembling into {OUTPUT_VIDEO}")
     reassemble_video(MARKED_DIR, OUTPUT_VIDEO, fps, w, h)
+
+    # Write results.json for this engine
+    results = {
+        "engine": engine, "target": TARGET_WORD,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "frames_total": len(frames), "frames_found": found,
+        "avg_confidence": round(avg_conf, 4),
+        "per_frame": per_frame,
+    }
+    results_path = f"results_{engine}.json"
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  Results saved to {results_path}")
 
     # Cleanup frame dirs
     shutil.rmtree(FRAMES_DIR, ignore_errors=True)
