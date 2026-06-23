@@ -23,23 +23,24 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #22: Canny ∩ HSV bright-pixel mask fusion + CRNN ---
-# Novel approach: Computes TWO independent masks — (A) standard Canny edges on
-# grayscale, and (B) an HSV-based bright-text pixel mask (low saturation + high
-# value, like Engine 18). Bitwise AND of both masks fuses structural edge
-# information with chrominance/brightness filtering. Canny alone has spurious
-# background edges; HSV mask alone has gaps within characters. The intersection
-# yields clean, connected text edges with background noise suppressed — a hybrid
-# paradigm no prior engine has used (Engines 17/19/20/21 use Canny variants only;
-# Engine 18 uses HSV segmentation only).
+# --- Engine #23: Morphological gradient + threshold + dilation + CRNN ---
+# Novel approach: Uses cv2.morphologyEx with MORPH_GRADIENT (dilate - erode)
+# which highlights object BOUNDARIES morphologically. Unlike Canny/Sobel which
+# compute intensity gradients analytically, the morphological gradient uses
+# structuring element operations — it dilates then erodes and takes the
+# difference. This naturally highlights text stroke outlines (where pixel
+# values change rapidly at the character boundary scale set by the kernel).
+# After gradient extraction, Otsu thresholding binarizes, horizontal dilation
+# connects characters, and CRNN recognizes. Pure morphological detection
+# paradigm — no gradient computation, no color space conversion.
 from rapidocr_onnxruntime import RapidOCR
 
 _rapid = RapidOCR()
 _recognizer = _rapid.text_rec
 
 # Pre-build morphological kernels
+_grad_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 _dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
-_close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
 
 def _fuzzy_match(text, target, max_dist=3):
@@ -57,30 +58,23 @@ def _fuzzy_match(text, target, max_dist=3):
 
 
 def find_word(img_bgr, target):
-    """Engine #22: Canny ∩ HSV bright-pixel mask fusion + CRNN.
+    """Engine #23: Morphological gradient + threshold + CRNN.
     Return list of (x1, y1, x2, y2, text, conf).
     """
     h, w = img_bgr.shape[:2]
 
-    # --- Mask A: Canny edges on grayscale ---
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    canny_edges = cv2.Canny(gray, 50, 150)
 
-    # --- Mask B: HSV bright-text pixel mask ---
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    # Low saturation + high value → white/bright text pixels
-    hsv_mask = ((hsv[:, :, 1] < 80) & (hsv[:, :, 2] > 150)).astype(np.uint8) * 255
-    # Morphological closing to fill small gaps within characters
-    hsv_mask = cv2.morphologyEx(hsv_mask, cv2.MORPH_CLOSE, _close_kernel, iterations=2)
+    # Morphological gradient: highlights boundaries of bright objects (text)
+    gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, _grad_kernel)
 
-    # --- Fusion: bitwise AND of both masks ---
-    # Keeps only edges that coincide with bright-text pixels
-    fused = cv2.bitwise_and(canny_edges, hsv_mask)
+    # Otsu threshold to binarize gradient response
+    _, binary = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Dilate horizontally to connect character edges into text lines
-    dilated = cv2.dilate(fused, _dilate_kernel, iterations=1)
+    # Dilate horizontally to connect character boundaries into text lines
+    dilated = cv2.dilate(binary, _dilate_kernel, iterations=1)
 
-    # Find contours of dilated fused regions
+    # Find contours
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -99,7 +93,7 @@ def find_word(img_bgr, target):
     candidates.sort(key=lambda r: r[4], reverse=True)
 
     # Recognize each candidate region (crop from ORIGINAL frame)
-    for (rx, ry, rw, rh, _) in candidates[:10]:
+    for (rx, ry, rw, rh, _) in candidates[:20]:
         pad = 5
         x1 = max(0, rx - pad)
         y1 = max(0, ry - pad)
