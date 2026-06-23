@@ -23,23 +23,23 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #21: Gaussian blur + Canny edge + dilation + CRNN ---
-# Novel approach: Applies standard 5x5 Gaussian blur (sigma=0) to the frame before
-# Canny edge detection. Unlike bilateral filter (Engine 19, nonlinear, edge-
-# preserving), Gaussian blur is a linear low-pass filter that attenuates high-
-# frequency noise uniformly. This smooths fine background texture while text
-# edges remain detectable by Canny's hysteresis thresholding. The key
-# distinction from Engine 17 (raw Canny) is noise reduction; from Engine 19
-# (bilateral + Canny) is that Gaussian does NOT preserve edges — it blurs
-# everything equally, which paradoxically helps Canny by suppressing weak
-# background edges below the low threshold. Distinct from all prior engines.
+# --- Engine #22: Canny ∩ HSV bright-pixel mask fusion + CRNN ---
+# Novel approach: Computes TWO independent masks — (A) standard Canny edges on
+# grayscale, and (B) an HSV-based bright-text pixel mask (low saturation + high
+# value, like Engine 18). Bitwise AND of both masks fuses structural edge
+# information with chrominance/brightness filtering. Canny alone has spurious
+# background edges; HSV mask alone has gaps within characters. The intersection
+# yields clean, connected text edges with background noise suppressed — a hybrid
+# paradigm no prior engine has used (Engines 17/19/20/21 use Canny variants only;
+# Engine 18 uses HSV segmentation only).
 from rapidocr_onnxruntime import RapidOCR
 
 _rapid = RapidOCR()
 _recognizer = _rapid.text_rec
 
-# Pre-build morphological kernel for horizontal text line connection
+# Pre-build morphological kernels
 _dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+_close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
 
 def _fuzzy_match(text, target, max_dist=3):
@@ -57,22 +57,30 @@ def _fuzzy_match(text, target, max_dist=3):
 
 
 def find_word(img_bgr, target):
-    """Engine #21: Gaussian blur + Canny edge + dilation + CRNN.
+    """Engine #22: Canny ∩ HSV bright-pixel mask fusion + CRNN.
     Return list of (x1, y1, x2, y2, text, conf).
     """
     h, w = img_bgr.shape[:2]
 
-    # Gaussian blur: linear low-pass filter to suppress high-freq noise
-    blurred = cv2.GaussianBlur(img_bgr, (5, 5), 0)
-    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+    # --- Mask A: Canny edges on grayscale ---
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    canny_edges = cv2.Canny(gray, 50, 150)
 
-    # Canny edge detection on the smoothed image
-    edges = cv2.Canny(gray, 50, 150)
+    # --- Mask B: HSV bright-text pixel mask ---
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    # Low saturation + high value → white/bright text pixels
+    hsv_mask = ((hsv[:, :, 1] < 80) & (hsv[:, :, 2] > 150)).astype(np.uint8) * 255
+    # Morphological closing to fill small gaps within characters
+    hsv_mask = cv2.morphologyEx(hsv_mask, cv2.MORPH_CLOSE, _close_kernel, iterations=2)
+
+    # --- Fusion: bitwise AND of both masks ---
+    # Keeps only edges that coincide with bright-text pixels
+    fused = cv2.bitwise_and(canny_edges, hsv_mask)
 
     # Dilate horizontally to connect character edges into text lines
-    dilated = cv2.dilate(edges, _dilate_kernel, iterations=1)
+    dilated = cv2.dilate(fused, _dilate_kernel, iterations=1)
 
-    # Find contours of dilated edge regions
+    # Find contours of dilated fused regions
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
