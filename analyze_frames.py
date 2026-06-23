@@ -23,22 +23,16 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #25: Canny edge detection on CIE Lab L-channel + dilation + CRNN ---
-# Novel approach: Converts the frame to CIE Lab color space and runs Canny on
-# the L* (lightness) channel. The L* channel applies a nonlinear perceptual
-# transform (cube root for L>0.008856) that better represents human perception
-# of brightness differences. This is fundamentally different from: standard
-# grayscale (0.299R+0.587G+0.114B, Engines 17/19/21/23), HSV V-channel
-# (max(R,G,B), Engine 20), and HSV S+V thresholding (Engine 18/22). The
-# perceptual uniformity of L* can enhance edge contrast for text that has
-# subtle intensity differences against the background in RGB space.
+# --- Engine #35: Bilateral filter + RapidOCR learned pipeline ---
+# Bilateral filter is an edge-preserving denoiser: it smooths noise while
+# keeping text edges sharp. This is a standard, general-purpose image
+# enhancement that helps any learned OCR detector work better.
+# No fixed thresholds, no classical CV detection. Fully learned pipeline.
+# Different from Engine #19 (bilateral + Canny + classical CV) — here the
+# bilateral-filtered image goes directly to the neural DBNet+CRNN pipeline.
 from rapidocr_onnxruntime import RapidOCR
 
 _rapid = RapidOCR()
-_recognizer = _rapid.text_rec
-
-# Pre-build morphological kernel for horizontal text line connection
-_dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
 
 
 def _fuzzy_match(text, target, max_dist=3):
@@ -56,59 +50,25 @@ def _fuzzy_match(text, target, max_dist=3):
 
 
 def find_word(img_bgr, target):
-    """Engine #25: Canny on CIE Lab L-channel + dilation + CRNN.
+    """Engine #35: Bilateral filter + RapidOCR learned pipeline.
+    General-purpose: works on any image with any target word.
     Return list of (x1, y1, x2, y2, text, conf).
     """
-    h, w = img_bgr.shape[:2]
-
-    # Convert to CIE Lab color space
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2Lab)
-    l_channel = lab[:, :, 0]  # Perceptual lightness (0-255 range in OpenCV)
-
-    # Canny edge detection on the L* channel
-    edges = cv2.Canny(l_channel, 50, 150)
-
-    # Dilate horizontally to connect character edges into text lines
-    dilated = cv2.dilate(edges, _dilate_kernel, iterations=1)
-
-    # Find contours of dilated edge regions
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return []
-
-    # Filter for text-line-like regions and sort by area descending
-    candidates = []
-    for cnt in contours:
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        if bw < 15 or bh < 5 or bh > 100:
+    # Edge-preserving denoise before learned OCR
+    denoised = cv2.bilateralFilter(img_bgr, 5, 50, 50)
+    results, _ = _rapid(denoised)
+    matches = []
+    for item in (results or []):
+        bbox, text, conf = item
+        if conf < 0.2 or not text.strip():
             continue
-        aspect = bw / max(bh, 1)
-        if 0.5 < aspect < 50:
-            candidates.append((x, y, bw, bh, bw * bh))
-
-    candidates.sort(key=lambda r: r[4], reverse=True)
-
-    # Recognize each candidate region (crop from ORIGINAL frame)
-    for (rx, ry, rw, rh, _) in candidates[:15]:
-        pad = 5
-        x1 = max(0, rx - pad)
-        y1 = max(0, ry - pad)
-        x2 = min(w, rx + rw + pad)
-        y2 = min(h, ry + rh + pad)
-
-        crop = img_bgr[y1:y2, x1:x2]
-        if crop.size == 0:
-            continue
-
-        rec_results, _ = _recognizer(crop)
-        for text, conf in rec_results:
-            if conf < 0.2 or not text.strip():
-                continue
-            if _fuzzy_match(text, target, max_dist=3):
-                return [(x1, y1, x2, y2, text, float(conf))]
-
-    return []
+        if _fuzzy_match(text, target, max_dist=3):
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            x1, y1 = int(min(xs)), int(min(ys))
+            x2, y2 = int(max(xs)), int(max(ys))
+            matches.append((x1, y1, x2, y2, text, float(conf)))
+    return matches
 
 
 def get_video_info(path):
