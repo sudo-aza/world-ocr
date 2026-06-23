@@ -23,24 +23,25 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #23: Morphological gradient + threshold + dilation + CRNN ---
-# Novel approach: Uses cv2.morphologyEx with MORPH_GRADIENT (dilate - erode)
-# which highlights object BOUNDARIES morphologically. Unlike Canny/Sobel which
-# compute intensity gradients analytically, the morphological gradient uses
-# structuring element operations — it dilates then erodes and takes the
-# difference. This naturally highlights text stroke outlines (where pixel
-# values change rapidly at the character boundary scale set by the kernel).
-# After gradient extraction, Otsu thresholding binarizes, horizontal dilation
-# connects characters, and CRNN recognizes. Pure morphological detection
-# paradigm — no gradient computation, no color space conversion.
+# --- Engine #24: White Top-Hat transform + Otsu threshold + morphological closing + CRNN ---
+# Novel approach: Uses cv2.morphologyEx with MORPH_TOPHAT (white top-hat),
+# which extracts bright structures smaller than the structuring element from
+# a dark background. Formula: tophat(src) = src - opening(src). The opening
+# (erode then dilate) removes bright features smaller than the kernel;
+# subtracting from the original isolates those bright features — perfect for
+# white text on darker backgrounds. Engine 9 tried top-hat but failed (0/240)
+# because it used adaptive threshold + Tesseract recognition. This engine uses
+# Otsu global threshold (more robust for bimodal tophat output) and CRNN
+# recognition (proven reliable). A larger rectangular kernel (21x21) captures
+# text line structure; closing connects characters.
 from rapidocr_onnxruntime import RapidOCR
 
 _rapid = RapidOCR()
 _recognizer = _rapid.text_rec
 
 # Pre-build morphological kernels
-_grad_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-_dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+_tophat_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
+_close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
 
 
 def _fuzzy_match(text, target, max_dist=3):
@@ -58,24 +59,24 @@ def _fuzzy_match(text, target, max_dist=3):
 
 
 def find_word(img_bgr, target):
-    """Engine #23: Morphological gradient + threshold + CRNN.
+    """Engine #24: White Top-Hat + Otsu + morphological closing + CRNN.
     Return list of (x1, y1, x2, y2, text, conf).
     """
     h, w = img_bgr.shape[:2]
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Morphological gradient: highlights boundaries of bright objects (text)
-    gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, _grad_kernel)
+    # White top-hat: extract bright structures (text) smaller than kernel
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, _tophat_kernel)
 
-    # Otsu threshold to binarize gradient response
-    _, binary = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Otsu threshold to binarize the extracted text regions
+    _, binary = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Dilate horizontally to connect character boundaries into text lines
-    dilated = cv2.dilate(binary, _dilate_kernel, iterations=1)
+    # Morphological closing to connect adjacent character blobs into text lines
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, _close_kernel, iterations=2)
 
     # Find contours
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return []
@@ -93,7 +94,7 @@ def find_word(img_bgr, target):
     candidates.sort(key=lambda r: r[4], reverse=True)
 
     # Recognize each candidate region (crop from ORIGINAL frame)
-    for (rx, ry, rw, rh, _) in candidates[:20]:
+    for (rx, ry, rw, rh, _) in candidates[:15]:
         pad = 5
         x1 = max(0, rx - pad)
         y1 = max(0, ry - pad)

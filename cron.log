@@ -20,3 +20,5 @@
 === 2026-06-23T05:00:00+00:00 — Canny edge detection on HSV V-channel + morphological dilation + CRNN recognition (Engine 20) — 239/240 frames with boxes drawn ===
 === 2026-06-23T06:00:00+00:00 — Gaussian blur + Canny edge + morphological dilation + CRNN recognition (Engine 21) — 239/240 frames with boxes drawn ===
 === 2026-06-23T09:00:00+00:00 — Canny ∩ HSV bright-pixel mask fusion + morphological dilation + CRNN recognition (Engine 22) — 239/240 frames with boxes drawn ===
+=== 2026-06-23T09:00:00+00:00 — Morphological gradient (dilate-erode) + Otsu threshold + horizontal dilation + CRNN recognition (Engine 23) — 232/240 frames with boxes drawn ===
+=== 2026-06-23T11:00:00+00:00 — White Top-Hat transform + Otsu threshold + morphological closing + CRNN recognition (Engine 24) — 237/240 frames with boxes drawn ===
