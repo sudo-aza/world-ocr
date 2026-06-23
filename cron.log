@@ -14,3 +14,4 @@
 === 2026-06-22T21:03:29+00:00 — DBNet (onnxruntime) score-map template tracking + Tesseract init (Engine 14) — 240/240 frames with boxes drawn ===
 === 2026-06-22T22:11:22+00:00 — tesserocr (Tesseract C API binding, PSM 6) (Engine 15) — 235/240 frames with boxes drawn ===
 === 2026-06-23T01:26:42+0000 — DBNet score-map contour detection + RapidOCR TextRecognizer (Engine 16) — 239/240 frames with boxes drawn ===
+=== 2026-06-23T02:10:00+00:00 — Canny edge + morphological dilation text line detection + CRNN recognition (Engine 17) — 239/240 frames with boxes drawn ===

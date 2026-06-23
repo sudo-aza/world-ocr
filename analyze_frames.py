@@ -23,34 +23,30 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #16: DBNet score-map region detection + RapidOCR TextRecognizer ---
-# Novel hybrid pipeline: Uses onnxruntime to run the DBNet detector and extract
-# a raw score map (no DBPostProcess), then thresholds and finds the bounding box
-# of text regions. Crops are fed to RapidOCR's TextRecognizer for word-level
-# recognition. This is distinct from:
-#   - Engine 1 (RapidOCR full pipeline): uses RapidOCR's own detector+recognizer
-#   - Engines 5,7,8,11 (raw ONNX/cv2.dnn DBNet + CRNN): use DBPostProcess polygon detection
-#   - Engine 14 (score-map template tracking): matches template, no per-frame recognition
-#   - Engine 10 (cv2.dnn DBNet + Tesseract): different detector backend + different recognizer
-# The novel aspect is: onnxruntime DBNet score-map for localization (not polygon detection)
-# paired with RapidOCR's TextRecognizer (which handles preprocessing correctly)
-# for recognition on the detected region.
-import onnxruntime as ort
+# --- Engine #17: Canny edge + morphological dilation text line detection + CRNN ---
+# Novel approach: Uses Canny edge detection followed by horizontal morphological
+# dilation to connect character edges into text line regions, then finds contours
+# as bounding boxes. Crops are fed to RapidOCR's CRNN recognizer. This is a
+# classical CV pipeline with NO neural network for detection — fundamentally
+# different from all prior engines:
+#   - Engines 1,5,7,8,11,13,16 (DBNet/RapidOCR): neural network text detectors
+#   - Engines 2,3,6,9,10,12,15 (Tesseract): Tesseract's built-in detector
+#   - Engine 14 (template tracking): score-map template matching
+#   - Engine 4 (OCR.space): cloud API
+#   - Engine 9 (morph top-hat + Tesseract): used morphological ops as
+#     preprocessing for Tesseract, not as the primary detection method
+# The novelty is: Canny edges + horizontal dilation as a standalone text line
+# detector (no learned model) paired with a learned recognizer.
 from rapidocr_onnxruntime import RapidOCR
 
-# DBNet detector via onnxruntime (for score map extraction)
-_det_sess = ort.InferenceSession(
-    '/home/z/my-project/world-ocr/models/ch_PP-OCRv4_det_infer.onnx',
-    providers=['CPUExecutionProvider']
-)
-_det_input_name = _det_sess.get_inputs()[0].name
-
-# RapidOCR's TextRecognizer (handles CRNN preprocessing correctly)
 _rapid = RapidOCR()
 _recognizer = _rapid.text_rec
 
+# Pre-build morphological kernel for horizontal text line connection
+_dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
 
-def _fuzzy_match(text, target, max_dist=2):
+
+def _fuzzy_match(text, target, max_dist=3):
     text_lower = text.lower().strip()
     target_lower = target.lower()
     tlen = len(target_lower)
@@ -65,67 +61,56 @@ def _fuzzy_match(text, target, max_dist=2):
 
 
 def find_word(img_bgr, target):
-    """Engine #16: DBNet score-map + RapidOCR recognizer.
+    """Engine #17: Canny edge + morphological dilation detection + CRNN recognition.
     Return list of (x1, y1, x2, y2, text, conf).
     """
     h, w = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Run DBNet detector to get score map
-    blob = cv2.dnn.blobFromImage(img_bgr, 1.0 / 255., (640, 640),
-                                 (0.485, 0.456, 0.406), True, False)
-    score_map = _det_sess.run(['sigmoid_0.tmp_0'],
-                               {_det_input_name: blob})[0][0, 0]
+    # Canny edge detection
+    edges = cv2.Canny(gray, 50, 150)
 
-    # Threshold to find text regions
-    text_mask = (score_map > 0.3).astype(np.uint8) * 255
+    # Dilate horizontally to connect character edges into text lines
+    dilated = cv2.dilate(edges, _dilate_kernel, iterations=1)
 
-    # Find contours of text regions
-    contours, _ = cv2.findContours(text_mask, cv2.RETR_EXTERNAL,
+    # Find contours of dilated edge regions
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
-
     if not contours:
         return []
 
-    # Get bounding boxes, scaled from 640x640 to original image
-    text_regions = []
+    # Filter for text-line-like regions and sort by area descending
+    candidates = []
     for cnt in contours:
         x, y, bw, bh = cv2.boundingRect(cnt)
-        sx = x * w / 640
-        sy = y * h / 640
-        sw = bw * w / 640
-        sh = bh * h / 640
-        if sw > 20 and sh > 5:
-            text_regions.append((sx, sy, sw, sh))
+        if bw < 15 or bh < 5 or bh > 100:
+            continue
+        aspect = bw / max(bh, 1)
+        if 0.5 < aspect < 50:
+            candidates.append((x, y, bw, bh, bw * bh))
 
-    if not text_regions:
-        return []
+    candidates.sort(key=lambda r: r[4], reverse=True)
 
-    # Sort by area (largest first — most likely to contain the target word)
-    text_regions.sort(key=lambda r: r[2] * r[3], reverse=True)
-
-    # Recognize each text region
-    matches = []
-    for (rx, ry, rw, rh) in text_regions:
+    # Recognize each candidate region
+    for (rx, ry, rw, rh, _) in candidates[:10]:
         pad = 5
-        x1 = max(0, int(rx) - pad)
-        y1 = max(0, int(ry) - pad)
-        x2 = min(w, int(rx + rw) + pad)
-        y2 = min(h, int(ry + rh) + pad)
+        x1 = max(0, rx - pad)
+        y1 = max(0, ry - pad)
+        x2 = min(w, rx + rw + pad)
+        y2 = min(h, ry + rh + pad)
 
         crop = img_bgr[y1:y2, x1:x2]
         if crop.size == 0:
             continue
 
-        # Use RapidOCR's recognizer
         rec_results, _ = _recognizer(crop)
         for text, conf in rec_results:
-            if conf < 0.3 or not text.strip():
+            if conf < 0.2 or not text.strip():
                 continue
-            if _fuzzy_match(text, target, max_dist=2):
-                matches.append((x1, y1, x2, y2, text, conf))
-                return matches  # First match
+            if _fuzzy_match(text, target, max_dist=3):
+                return [(x1, y1, x2, y2, text, float(conf))]
 
-    return matches
+    return []
 
 
 def get_video_info(path):
