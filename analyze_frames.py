@@ -23,27 +23,27 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #17: Canny edge + morphological dilation text line detection + CRNN ---
-# Novel approach: Uses Canny edge detection followed by horizontal morphological
-# dilation to connect character edges into text line regions, then finds contours
-# as bounding boxes. Crops are fed to RapidOCR's CRNN recognizer. This is a
-# classical CV pipeline with NO neural network for detection — fundamentally
-# different from all prior engines:
-#   - Engines 1,5,7,8,11,13,16 (DBNet/RapidOCR): neural network text detectors
-#   - Engines 2,3,6,9,10,12,15 (Tesseract): Tesseract's built-in detector
+# --- Engine #18: HSV color-space text segmentation + morphological closing + CRNN ---
+# Novel approach: Converts frame to HSV color space, thresholds for bright
+# low-saturation pixels (white/light text on dark background), applies
+# morphological closing to connect character regions into text lines,
+# then finds contours as bounding boxes. Crops are fed to RapidOCR's
+# CRNN recognizer. Distinct from all prior engines:
+#   - Engine 17 (Canny + dilation): uses edge-based detection, not color
+#   - Engines 1,5,7,8,11,13,16 (DBNet/RapidOCR): neural network detectors
+#   - Engines 2,3,6,9,10,12,15 (Tesseract): built-in detection
 #   - Engine 14 (template tracking): score-map template matching
 #   - Engine 4 (OCR.space): cloud API
-#   - Engine 9 (morph top-hat + Tesseract): used morphological ops as
-#     preprocessing for Tesseract, not as the primary detection method
-# The novelty is: Canny edges + horizontal dilation as a standalone text line
-# detector (no learned model) paired with a learned recognizer.
+# The novelty is color-space based pixel classification for text detection
+# (hue/saturation/value thresholding) — no gradient/edge computation
+# and no neural network for the detection stage.
 from rapidocr_onnxruntime import RapidOCR
 
 _rapid = RapidOCR()
 _recognizer = _rapid.text_rec
 
-# Pre-build morphological kernel for horizontal text line connection
-_dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+# Pre-build morphological kernel for closing (connect character blobs)
+_close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
 
 
 def _fuzzy_match(text, target, max_dist=3):
@@ -61,20 +61,20 @@ def _fuzzy_match(text, target, max_dist=3):
 
 
 def find_word(img_bgr, target):
-    """Engine #17: Canny edge + morphological dilation detection + CRNN recognition.
+    """Engine #18: HSV text segmentation + morphological closing + CRNN.
     Return list of (x1, y1, x2, y2, text, conf).
     """
     h, w = img_bgr.shape[:2]
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Canny edge detection
-    edges = cv2.Canny(gray, 50, 150)
+    # Convert to HSV and isolate bright, low-saturation pixels (white text)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    mask = ((hsv[:, :, 1] < 80) & (hsv[:, :, 2] > 150)).astype(np.uint8) * 255
 
-    # Dilate horizontally to connect character edges into text lines
-    dilated = cv2.dilate(edges, _dilate_kernel, iterations=1)
+    # Morphological closing to connect nearby character blobs into lines
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _close_kernel)
 
-    # Find contours of dilated edge regions
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
+    # Find contours of connected text regions
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return []
