@@ -23,25 +23,22 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #24: White Top-Hat transform + Otsu threshold + morphological closing + CRNN ---
-# Novel approach: Uses cv2.morphologyEx with MORPH_TOPHAT (white top-hat),
-# which extracts bright structures smaller than the structuring element from
-# a dark background. Formula: tophat(src) = src - opening(src). The opening
-# (erode then dilate) removes bright features smaller than the kernel;
-# subtracting from the original isolates those bright features — perfect for
-# white text on darker backgrounds. Engine 9 tried top-hat but failed (0/240)
-# because it used adaptive threshold + Tesseract recognition. This engine uses
-# Otsu global threshold (more robust for bimodal tophat output) and CRNN
-# recognition (proven reliable). A larger rectangular kernel (21x21) captures
-# text line structure; closing connects characters.
+# --- Engine #25: Canny edge detection on CIE Lab L-channel + dilation + CRNN ---
+# Novel approach: Converts the frame to CIE Lab color space and runs Canny on
+# the L* (lightness) channel. The L* channel applies a nonlinear perceptual
+# transform (cube root for L>0.008856) that better represents human perception
+# of brightness differences. This is fundamentally different from: standard
+# grayscale (0.299R+0.587G+0.114B, Engines 17/19/21/23), HSV V-channel
+# (max(R,G,B), Engine 20), and HSV S+V thresholding (Engine 18/22). The
+# perceptual uniformity of L* can enhance edge contrast for text that has
+# subtle intensity differences against the background in RGB space.
 from rapidocr_onnxruntime import RapidOCR
 
 _rapid = RapidOCR()
 _recognizer = _rapid.text_rec
 
-# Pre-build morphological kernels
-_tophat_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
-_close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+# Pre-build morphological kernel for horizontal text line connection
+_dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
 
 
 def _fuzzy_match(text, target, max_dist=3):
@@ -59,24 +56,23 @@ def _fuzzy_match(text, target, max_dist=3):
 
 
 def find_word(img_bgr, target):
-    """Engine #24: White Top-Hat + Otsu + morphological closing + CRNN.
+    """Engine #25: Canny on CIE Lab L-channel + dilation + CRNN.
     Return list of (x1, y1, x2, y2, text, conf).
     """
     h, w = img_bgr.shape[:2]
 
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    # Convert to CIE Lab color space
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2Lab)
+    l_channel = lab[:, :, 0]  # Perceptual lightness (0-255 range in OpenCV)
 
-    # White top-hat: extract bright structures (text) smaller than kernel
-    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, _tophat_kernel)
+    # Canny edge detection on the L* channel
+    edges = cv2.Canny(l_channel, 50, 150)
 
-    # Otsu threshold to binarize the extracted text regions
-    _, binary = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Dilate horizontally to connect character edges into text lines
+    dilated = cv2.dilate(edges, _dilate_kernel, iterations=1)
 
-    # Morphological closing to connect adjacent character blobs into text lines
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, _close_kernel, iterations=2)
-
-    # Find contours
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
+    # Find contours of dilated edge regions
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return []
