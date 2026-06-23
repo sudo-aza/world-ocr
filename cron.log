@@ -18,3 +18,4 @@
 === 2026-06-23T03:00:00+00:00 — HSV color-space text segmentation + morphological closing + CRNN recognition (Engine 18) — 239/240 frames with boxes drawn ===
 === 2026-06-23T04:00:00+00:00 — Bilateral filter + Canny edge + morphological dilation + CRNN recognition (Engine 19) — 239/240 frames with boxes drawn ===
 === 2026-06-23T05:00:00+00:00 — Canny edge detection on HSV V-channel + morphological dilation + CRNN recognition (Engine 20) — 239/240 frames with boxes drawn ===
+=== 2026-06-23T06:00:00+00:00 — Gaussian blur + Canny edge + morphological dilation + CRNN recognition (Engine 21) — 239/240 frames with boxes drawn ===

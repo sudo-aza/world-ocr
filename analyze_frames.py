@@ -23,20 +23,16 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #20: Canny edge detection on HSV V-channel + dilation + CRNN ---
-# Novel approach: Extracts the V (brightness/value) channel from HSV color space,
-# then runs Canny edge detection on it. The V channel isolates pure brightness
-# information, removing color/hue variations that create spurious edges in
-# standard grayscale (which weights R,G,B). This produces cleaner edge maps
-# for text detection. Horizontal dilation connects character edges into text
-# lines, then contours feed crops to CRNN. Distinct from all prior engines:
-#   - Engine 17 (Canny on grayscale): grayscale mixes color channels, noisier
-#   - Engine 18 (HSV pixel classification): threshold-based, no edge detection
-#   - Engine 19 (bilateral + Canny on grayscale): smoothing preprocessing
-#   - All DBNet/Tesseract/template/API engines: completely different detection
-# The novelty: Canny specifically on the V channel — a color-space-aware edge
-# detection that exploits the HSV decomposition to separate luminance edges
-# from chrominance noise.
+# --- Engine #21: Gaussian blur + Canny edge + dilation + CRNN ---
+# Novel approach: Applies standard 5x5 Gaussian blur (sigma=0) to the frame before
+# Canny edge detection. Unlike bilateral filter (Engine 19, nonlinear, edge-
+# preserving), Gaussian blur is a linear low-pass filter that attenuates high-
+# frequency noise uniformly. This smooths fine background texture while text
+# edges remain detectable by Canny's hysteresis thresholding. The key
+# distinction from Engine 17 (raw Canny) is noise reduction; from Engine 19
+# (bilateral + Canny) is that Gaussian does NOT preserve edges — it blurs
+# everything equally, which paradoxically helps Canny by suppressing weak
+# background edges below the low threshold. Distinct from all prior engines.
 from rapidocr_onnxruntime import RapidOCR
 
 _rapid = RapidOCR()
@@ -61,17 +57,17 @@ def _fuzzy_match(text, target, max_dist=3):
 
 
 def find_word(img_bgr, target):
-    """Engine #20: Canny on HSV V-channel + dilation + CRNN.
+    """Engine #21: Gaussian blur + Canny edge + dilation + CRNN.
     Return list of (x1, y1, x2, y2, text, conf).
     """
     h, w = img_bgr.shape[:2]
 
-    # Extract V (brightness) channel from HSV
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    v_channel = hsv[:, :, 2]
+    # Gaussian blur: linear low-pass filter to suppress high-freq noise
+    blurred = cv2.GaussianBlur(img_bgr, (5, 5), 0)
+    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
 
-    # Canny edge detection on the brightness channel
-    edges = cv2.Canny(v_channel, 50, 150)
+    # Canny edge detection on the smoothed image
+    edges = cv2.Canny(gray, 50, 150)
 
     # Dilate horizontally to connect character edges into text lines
     dilated = cv2.dilate(edges, _dilate_kernel, iterations=1)
@@ -94,7 +90,7 @@ def find_word(img_bgr, target):
 
     candidates.sort(key=lambda r: r[4], reverse=True)
 
-    # Recognize each candidate region
+    # Recognize each candidate region (crop from ORIGINAL frame)
     for (rx, ry, rw, rh, _) in candidates[:10]:
         pad = 5
         x1 = max(0, rx - pad)
