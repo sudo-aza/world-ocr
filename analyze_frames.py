@@ -23,16 +23,31 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #15: tesserocr (Tesseract C API binding) full-frame OCR ---
-# Novel: uses tesserocr's PyTessBaseAPI direct C library binding instead of
-# subprocess-based Tesseract CLI or pytesseract wrapper. Eliminates process
-# spawn overhead (~0.18s/frame vs ~0.5s/frame with subprocess).
-# PSM SINGLE_BLOCK for robust text line detection on each frame.
-# Distinct from all prior Tesseract engines (2,3,6,9,10,12) which used CLI subprocess.
-import tesserocr
-from PIL import Image as PILImage
+# --- Engine #16: DBNet score-map region detection + RapidOCR TextRecognizer ---
+# Novel hybrid pipeline: Uses onnxruntime to run the DBNet detector and extract
+# a raw score map (no DBPostProcess), then thresholds and finds the bounding box
+# of text regions. Crops are fed to RapidOCR's TextRecognizer for word-level
+# recognition. This is distinct from:
+#   - Engine 1 (RapidOCR full pipeline): uses RapidOCR's own detector+recognizer
+#   - Engines 5,7,8,11 (raw ONNX/cv2.dnn DBNet + CRNN): use DBPostProcess polygon detection
+#   - Engine 14 (score-map template tracking): matches template, no per-frame recognition
+#   - Engine 10 (cv2.dnn DBNet + Tesseract): different detector backend + different recognizer
+# The novel aspect is: onnxruntime DBNet score-map for localization (not polygon detection)
+# paired with RapidOCR's TextRecognizer (which handles preprocessing correctly)
+# for recognition on the detected region.
+import onnxruntime as ort
+from rapidocr_onnxruntime import RapidOCR
 
-_tess_path = '/usr/share/tesseract-ocr/5/tessdata'
+# DBNet detector via onnxruntime (for score map extraction)
+_det_sess = ort.InferenceSession(
+    '/home/z/my-project/world-ocr/models/ch_PP-OCRv4_det_infer.onnx',
+    providers=['CPUExecutionProvider']
+)
+_det_input_name = _det_sess.get_inputs()[0].name
+
+# RapidOCR's TextRecognizer (handles CRNN preprocessing correctly)
+_rapid = RapidOCR()
+_recognizer = _rapid.text_rec
 
 
 def _fuzzy_match(text, target, max_dist=2):
@@ -50,30 +65,66 @@ def _fuzzy_match(text, target, max_dist=2):
 
 
 def find_word(img_bgr, target):
-    """Engine #15: tesserocr C API binding, full-frame PSM 6.
+    """Engine #16: DBNet score-map + RapidOCR recognizer.
     Return list of (x1, y1, x2, y2, text, conf).
     """
-    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pil_img = PILImage.fromarray(rgb)
+    h, w = img_bgr.shape[:2]
 
-    api = tesserocr.PyTessBaseAPI(path=_tess_path, lang='eng')
-    api.SetImage(pil_img)
-    api.SetPageSegMode(tesserocr.PSM.SINGLE_BLOCK)
-    api.Recognize()
+    # Run DBNet detector to get score map
+    blob = cv2.dnn.blobFromImage(img_bgr, 1.0 / 255., (640, 640),
+                                 (0.485, 0.456, 0.406), True, False)
+    score_map = _det_sess.run(['sigmoid_0.tmp_0'],
+                               {_det_input_name: blob})[0][0, 0]
 
+    # Threshold to find text regions
+    text_mask = (score_map > 0.3).astype(np.uint8) * 255
+
+    # Find contours of text regions
+    contours, _ = cv2.findContours(text_mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return []
+
+    # Get bounding boxes, scaled from 640x640 to original image
+    text_regions = []
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        sx = x * w / 640
+        sy = y * h / 640
+        sw = bw * w / 640
+        sh = bh * h / 640
+        if sw > 20 and sh > 5:
+            text_regions.append((sx, sy, sw, sh))
+
+    if not text_regions:
+        return []
+
+    # Sort by area (largest first — most likely to contain the target word)
+    text_regions.sort(key=lambda r: r[2] * r[3], reverse=True)
+
+    # Recognize each text region
     matches = []
-    level = tesserocr.RIL.WORD
-    for ri in tesserocr.iterate_level(api.GetIterator(), level):
-        text = ri.GetUTF8Text(level)
-        conf = ri.Confidence(level) / 100.0
-        if conf < 0.3 or not text:
-            continue
-        if _fuzzy_match(text, target, max_dist=2):
-            bbox = ri.BoundingBox(level)  # (x1, y1, x2, y2)
-            matches.append((bbox[0], bbox[1], bbox[2], bbox[3], text, conf))
-            break  # First match is enough
+    for (rx, ry, rw, rh) in text_regions:
+        pad = 5
+        x1 = max(0, int(rx) - pad)
+        y1 = max(0, int(ry) - pad)
+        x2 = min(w, int(rx + rw) + pad)
+        y2 = min(h, int(ry + rh) + pad)
 
-    api.End()
+        crop = img_bgr[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+
+        # Use RapidOCR's recognizer
+        rec_results, _ = _recognizer(crop)
+        for text, conf in rec_results:
+            if conf < 0.3 or not text.strip():
+                continue
+            if _fuzzy_match(text, target, max_dist=2):
+                matches.append((x1, y1, x2, y2, text, conf))
+                return matches  # First match
+
     return matches
 
 
