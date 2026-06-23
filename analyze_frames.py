@@ -23,20 +23,20 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #19: Bilateral filter (edge-preserving smoothing) + Canny + dilation + CRNN ---
-# Novel approach: Applies a bilateral filter (d=9, sigmaColor=75, sigmaSpace=75)
-# to smooth noise while preserving text edges, then runs Canny edge detection
-# on the smoothed grayscale image. Horizontal morphological dilation connects
-# character edges into text line blobs. Contour bounding boxes are fed to
-# RapidOCR's CRNN recognizer. Distinct from all prior engines:
-#   - Engine 17 (Canny + dilation + CRNN): Canny on raw grayscale, no preprocessing
-#   - Engine 12 (bilateral + Tesseract): bilateral was preprocessing for Tesseract's
-#     built-in detector, not for improving Canny edge quality
-#   - Engine 18 (HSV segmentation): color-based pixel classification, no edges
+# --- Engine #20: Canny edge detection on HSV V-channel + dilation + CRNN ---
+# Novel approach: Extracts the V (brightness/value) channel from HSV color space,
+# then runs Canny edge detection on it. The V channel isolates pure brightness
+# information, removing color/hue variations that create spurious edges in
+# standard grayscale (which weights R,G,B). This produces cleaner edge maps
+# for text detection. Horizontal dilation connects character edges into text
+# lines, then contours feed crops to CRNN. Distinct from all prior engines:
+#   - Engine 17 (Canny on grayscale): grayscale mixes color channels, noisier
+#   - Engine 18 (HSV pixel classification): threshold-based, no edge detection
+#   - Engine 19 (bilateral + Canny on grayscale): smoothing preprocessing
 #   - All DBNet/Tesseract/template/API engines: completely different detection
-# The novelty: bilateral filter specifically chosen to enhance Canny edge detection
-# quality — its edge-preserving smoothing property suppresses background texture
-# noise while maintaining sharp text stroke edges, producing cleaner edge maps.
+# The novelty: Canny specifically on the V channel — a color-space-aware edge
+# detection that exploits the HSV decomposition to separate luminance edges
+# from chrominance noise.
 from rapidocr_onnxruntime import RapidOCR
 
 _rapid = RapidOCR()
@@ -61,17 +61,17 @@ def _fuzzy_match(text, target, max_dist=3):
 
 
 def find_word(img_bgr, target):
-    """Engine #19: Bilateral filter + Canny edge + dilation + CRNN.
+    """Engine #20: Canny on HSV V-channel + dilation + CRNN.
     Return list of (x1, y1, x2, y2, text, conf).
     """
     h, w = img_bgr.shape[:2]
 
-    # Bilateral filter: smooth noise while preserving text edges
-    smoothed = cv2.bilateralFilter(img_bgr, 9, 75, 75)
-    gray = cv2.cvtColor(smoothed, cv2.COLOR_BGR2GRAY)
+    # Extract V (brightness) channel from HSV
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    v_channel = hsv[:, :, 2]
 
-    # Canny edge detection on the smoothed image
-    edges = cv2.Canny(gray, 50, 150)
+    # Canny edge detection on the brightness channel
+    edges = cv2.Canny(v_channel, 50, 150)
 
     # Dilate horizontally to connect character edges into text lines
     dilated = cv2.dilate(edges, _dilate_kernel, iterations=1)
@@ -94,7 +94,7 @@ def find_word(img_bgr, target):
 
     candidates.sort(key=lambda r: r[4], reverse=True)
 
-    # Recognize each candidate region (crop from ORIGINAL frame, not smoothed)
+    # Recognize each candidate region
     for (rx, ry, rw, rh, _) in candidates[:10]:
         pad = 5
         x1 = max(0, rx - pad)
