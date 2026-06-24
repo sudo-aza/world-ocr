@@ -23,17 +23,21 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #37: Unsharp Mask sharpening + RapidOCR learned pipeline ---
-# Unsharp Masking: sharpened = original + alpha * (original - blurred).
-# Amplifies high-frequency edges (text strokes) while suppressing low-frequency
-# noise. A classic, general-purpose image sharpening technique used in
-# document imaging pipelines. No thresholds, works on any image.
-# Different from Engine #35 (bilateral denoise) and #36 (CLAHE contrast) —
-# this targets edge sharpening specifically.
+# --- Engine #38: Gamma correction + RapidOCR learned pipeline ---
+# Gamma correction: pixel_out = 255 * (pixel_in / 255) ^ gamma.
+# A standard, general-purpose nonlinear brightness/contrast adjustment.
+# gamma < 1 brightens shadows (reveals dark text on dark bg),
+# gamma > 1 darkens highlights. Gamma=0.8 is a mild shadow-boost used
+# widely in document imaging. No thresholds, no edge detection.
+# Different from #35 (bilateral), #36 (CLAHE), #37 (unsharp mask).
 from rapidocr_onnxruntime import RapidOCR
 import cv2
+import numpy as np
 
 _rapid = RapidOCR()
+_GAMMA = 0.8
+# Build 256-entry LUT for fast gamma correction
+_gamma_lut = np.array([255 * ((i / 255.0) ** _GAMMA) for i in range(256)], dtype=np.uint8)
 
 
 def _fuzzy_find_pos(text, target, max_dist=3):
@@ -73,14 +77,14 @@ def _sub_bbox(bbox, text, start_idx, end_idx):
 
 
 def find_word(img_bgr, target):
-    """Engine #37: Unsharp Mask + RapidOCR with sub-word bounding box.
+    """Engine #38: Gamma correction + RapidOCR with sub-word bounding box.
     General-purpose: works on any image with any target word.
     Return list of (x1, y1, x2, y2, text, conf).
     Bounding box is sliced proportionally to isolate just the target word.
     """
-    blurred = cv2.GaussianBlur(img_bgr, (0, 0), 3)
-    sharpened = cv2.addWeighted(img_bgr, 1.5, blurred, -0.5, 0)
-    results, _ = _rapid(sharpened)
+    # Apply gamma correction via LUT (fast, per-channel)
+    corrected = cv2.LUT(img_bgr, _gamma_lut)
+    results, _ = _rapid(corrected)
     matches = []
     for item in (results or []):
         bbox, text, conf = item
@@ -90,7 +94,6 @@ def find_word(img_bgr, target):
         if pos is None:
             continue
         start_idx, end_idx, matched_text = pos
-        # If target == full text, use original bbox
         if start_idx == 0 and end_idx == len(text):
             xs = [p[0] for p in bbox]; ys = [p[1] for p in bbox]
             matches.append((int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)), matched_text, float(conf)))
