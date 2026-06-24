@@ -36,26 +36,48 @@ import cv2
 _rapid = RapidOCR()
 
 
-def _fuzzy_match(text, target, max_dist=3):
+def _fuzzy_find_pos(text, target, max_dist=3):
+    """Find the best matching position of target in text.
+    Returns (start_char_index, end_char_index, matched_text) or None.
+    """
     text_lower = text.lower().strip()
     target_lower = target.lower()
     tlen = len(target_lower)
     if len(text_lower) < tlen:
-        return False
+        return None
+    best = None
     for i in range(len(text_lower) - tlen + 1):
         window = text_lower[i:i + tlen]
         diffs = sum(a != b for a, b in zip(window, target_lower))
         if diffs <= max_dist:
-            return True
-    return False
+            if best is None or diffs < best[0]:
+                best = (diffs, i, i + tlen, text[i:i + tlen])
+    if best is None:
+        return None
+    return (best[1], best[2], best[3])
+
+
+def _sub_bbox(bbox, text, start_idx, end_idx):
+    """Slice a 4-point bbox proportionally to the character range [start_idx, end_idx)."""
+    xs = [p[0] for p in bbox]
+    ys = [p[1] for p in bbox]
+    text_len = len(text)
+    if text_len == 0:
+        return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    # Proportional x-slicing based on character positions
+    x1 = x_min + (x_max - x_min) * start_idx / text_len
+    x2 = x_min + (x_max - x_min) * end_idx / text_len
+    return int(x1), int(y_min), int(x2), int(y_max)
 
 
 def find_word(img_bgr, target):
-    """Engine #37: Unsharp Mask sharpening + RapidOCR learned pipeline.
+    """Engine #37: Unsharp Mask + RapidOCR with sub-word bounding box.
     General-purpose: works on any image with any target word.
     Return list of (x1, y1, x2, y2, text, conf).
+    Bounding box is sliced proportionally to isolate just the target word.
     """
-    # Unsharp mask: sharpen edges by subtracting blurred version
     blurred = cv2.GaussianBlur(img_bgr, (0, 0), 3)
     sharpened = cv2.addWeighted(img_bgr, 1.5, blurred, -0.5, 0)
     results, _ = _rapid(sharpened)
@@ -64,12 +86,17 @@ def find_word(img_bgr, target):
         bbox, text, conf = item
         if conf < 0.2 or not text.strip():
             continue
-        if _fuzzy_match(text, target, max_dist=3):
-            xs = [p[0] for p in bbox]
-            ys = [p[1] for p in bbox]
-            x1, y1 = int(min(xs)), int(min(ys))
-            x2, y2 = int(max(xs)), int(max(ys))
-            matches.append((x1, y1, x2, y2, text, float(conf)))
+        pos = _fuzzy_find_pos(text, target, max_dist=3)
+        if pos is None:
+            continue
+        start_idx, end_idx, matched_text = pos
+        # If target == full text, use original bbox
+        if start_idx == 0 and end_idx == len(text):
+            xs = [p[0] for p in bbox]; ys = [p[1] for p in bbox]
+            matches.append((int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)), matched_text, float(conf)))
+        else:
+            x1, y1, x2, y2 = _sub_bbox(bbox, text, start_idx, end_idx)
+            matches.append((x1, y1, x2, y2, matched_text, float(conf)))
     return matches
 
 
