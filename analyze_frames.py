@@ -23,18 +23,17 @@ LABEL_THICKNESS = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- Engine #36: CLAHE on LAB L-channel + RapidOCR learned pipeline ---
-# Contrast Limited Adaptive Histogram Equalization (CLAHE) on the L-channel
-# of CIE Lab color space is a standard, general-purpose image enhancement.
-# Unlike global histogram equalization, CLAHE operates on small tiles,
-# preventing over-amplification while improving local text contrast.
-# Different from Engine #3 (CLAHE + Otsu + Tesseract) — here CLAHE feeds
-# the learned DBNet+CRNN pipeline directly, no thresholding.
+# --- Engine #37: Unsharp Mask sharpening + RapidOCR learned pipeline ---
+# Unsharp Masking: sharpened = original + alpha * (original - blurred).
+# Amplifies high-frequency edges (text strokes) while suppressing low-frequency
+# noise. A classic, general-purpose image sharpening technique used in
+# document imaging pipelines. No thresholds, works on any image.
+# Different from Engine #35 (bilateral denoise) and #36 (CLAHE contrast) —
+# this targets edge sharpening specifically.
 from rapidocr_onnxruntime import RapidOCR
 import cv2
 
 _rapid = RapidOCR()
-_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
 def _fuzzy_match(text, target, max_dist=3):
@@ -52,15 +51,14 @@ def _fuzzy_match(text, target, max_dist=3):
 
 
 def find_word(img_bgr, target):
-    """Engine #36: CLAHE on LAB L-channel + RapidOCR learned pipeline.
+    """Engine #37: Unsharp Mask sharpening + RapidOCR learned pipeline.
     General-purpose: works on any image with any target word.
     Return list of (x1, y1, x2, y2, text, conf).
     """
-    # Convert to LAB, apply CLAHE on L-channel for local contrast enhancement
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    lab[:, :, 0] = _clahe.apply(lab[:, :, 0])
-    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    results, _ = _rapid(enhanced)
+    # Unsharp mask: sharpen edges by subtracting blurred version
+    blurred = cv2.GaussianBlur(img_bgr, (0, 0), 3)
+    sharpened = cv2.addWeighted(img_bgr, 1.5, blurred, -0.5, 0)
+    results, _ = _rapid(sharpened)
     matches = []
     for item in (results or []):
         bbox, text, conf = item

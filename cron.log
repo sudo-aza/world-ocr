@@ -25,3 +25,4 @@
 === 2026-06-23T12:00:00+00:00 — Canny edge detection on CIE Lab L-channel + morphological dilation + CRNN recognition (Engine 25) — 239/240 frames with boxes drawn ===
 === 2026-06-23T22:11:25+0000 — Bilateral filter + RapidOCR learned pipeline (Engine 35) — 240/240 frames with boxes drawn ===
 === 2026-06-24T07:00:00+08:00 — CLAHE on LAB L-channel + RapidOCR learned pipeline (Engine 36) — 240/240 frames with boxes drawn ===
+=== 2026-06-24T08:00:00+08:00 — Unsharp Mask sharpening + RapidOCR learned pipeline (Engine 37) — 240/240 frames with boxes drawn ===
